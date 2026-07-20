@@ -9,11 +9,24 @@
 // algo que se pueda arreglar desde el plugin — pruébalo pronto y, si pasa,
 // es un límite del host, no un bug de este archivo.
 //
-// ⚠️ popular() y detail() son "best effort": no pude cargar una ficha de
-// manga real mientras escribía esto (mismo bloqueo de arriba), así que
-// esos dos usan heurísticas genéricas (enlaces a "/manga/", meta og:image,
-// <title>) en vez de selectores confirmados contra el HTML real. Revísalos
-// si algún campo vuelve vacío.
+// ⚠️ detail() sigue siendo "best effort" para description/status/author:
+// no pude cargar una ficha de manga real mientras escribía esto (mismo
+// bloqueo de arriba), así que usan heurísticas genéricas (spans con
+// "Sinopsis"/"Estado"/"Autor", meta og:description) en vez de selectores
+// confirmados contra el HTML real. Revísalos si algún campo vuelve vacío
+// o mal cortado.
+//
+// ✅ popular() sí se pudo verificar contra una instalación real (ver
+// captura del usuario): el problema no era falta de datos, sino que
+// (a) no extraía ninguna imagen, (b) deduplicaba por URL exacta en vez
+// de por serie (una misma serie aparecía una vez por cada capítulo
+// listado en portada), y (c) no filtraba enlaces de menú tipo
+// "/manga/generos" que casan con el mismo selector que una ficha real.
+// Las tres cosas están arregladas abajo. Ese primer punto probablemente
+// también explica la lentitud reportada: sin `cover` en popular(), lo más
+// habitual es que el cliente termine llamando a detail() por cada tarjeta
+// visible solo para conseguir la portada (48 peticiones de más en vez de
+// 1), así que arreglar esto debería acelerar la carga del listado.
  
 const BASE_URL = "https://www.leercapitulo.co";
 const PAGE_SIZE = 48; // MANGA_PAGE: offset -> página
@@ -39,6 +52,15 @@ function absoluteUrl(url) {
   } catch (e) {
     return undefined;
   }
+}
+ 
+// Quita etiquetas HTML y colapsa espacios — útil para sacar texto plano
+// de un bloque capturado por regex (título dentro de un <a>, sinopsis
+// dentro de un <span>, etc.)
+function stripTags(html) {
+  if (!html) return undefined;
+  const text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  return text || undefined;
 }
  
 // --- descifrado del array de páginas ---------------------------------------
@@ -79,37 +101,72 @@ function decodeArrayData(arrayData) {
     .filter(Boolean);
 }
  
+// Enlaces "/manga/..." de la portada que en realidad son menú (índice de
+// géneros, ranking, buscador...) y no una ficha individual. Si alguno se
+// cuela igual, añádelo aquí.
+const NAV_SLUGS = new Set([
+  "generos", "genero", "ranking", "directorio", "populares",
+  "ultimos-capitulos", "buscar", "avanzada",
+]);
+ 
+// Mismo filtro pero por texto del enlace, por si el slug no es
+// reconocible (algunos menús usan query params en vez de slug propio).
+const NAV_TITLES = new Set([
+  "géneros", "generos", "ranking", "directorio", "populares",
+  "inicio", "buscar", "búsqueda avanzada", "busqueda avanzada",
+]);
+ 
 // --- MangaProvider -----------------------------------------------------
  
 const plugin = {
   id: "leercapitulo",
   name: "LeerCapitulo",
  
-  // No encontré un endpoint de "populares" paginado de verdad: esto lee la
-  // portada y saca todos los enlaces "/manga/..." que hay en ella (mezcla
-  // la sección "Tendencias" con "Últimos Capitulos Agregados", porque sin
-  // el HTML real no puedo aislar solo la primera por clase). Al no ser
-  // paginable, offsets > 0 devuelven vacío.
+  // No hay un endpoint de "populares" paginado de verdad: esto lee la
+  // portada y saca las fichas de manga que hay en ella (mezcla
+  // "Tendencias" con "Últimos Capítulos Agregados"). Al no ser paginable,
+  // offsets > 0 devuelven vacío.
+  //
+  // Se hace con regex sobre el HTML crudo (no con harbor.parseHtml) para
+  // poder capturar en un solo paso el <a href="/manga/..."> Y la <img>
+  // que tiene dentro, y así sacar la portada sin peticiones adicionales.
   async popular(offset, tagId) {
     if (offset > 0) return [];
  
     const html = await fetchText("/");
     if (!html) return [];
  
-    const doc = await harbor.parseHtml(html);
-    const links = doc.querySelectorAll('a[href*="/manga/"]');
- 
+    const anchorRe = /<a\s+[^>]*href="([^"]*\/manga\/[^"]*)"[^>]*>([\s\S]*?)<\/a>/g;
     const seen = new Set();
     const results = [];
  
-    for (const a of links) {
-      const href = a.attr("href");
-      const title = a.text();
-      if (!href || !title || seen.has(href)) continue;
-      seen.add(href);
+    let match;
+    while ((match = anchorRe.exec(html)) && results.length < PAGE_SIZE) {
+      const href = match[1];
+      const inner = match[2];
  
-      results.push({ id: href, title });
-      if (results.length >= PAGE_SIZE) break;
+      const slugMatch = href.match(/\/manga\/([^/?#]+)/);
+      if (!slugMatch) continue;
+ 
+      const slug = slugMatch[1];
+      if (NAV_SLUGS.has(slug)) continue;
+ 
+      const imgMatch = inner.match(/<img[^>]*\s(?:data-src|data-original|src)="([^"]+)"/i);
+      const altMatch = inner.match(/<img[^>]*\salt="([^"]+)"/i);
+      const title = stripTags(inner) || altMatch?.[1]?.trim();
+      if (!title || NAV_TITLES.has(title.toLowerCase())) continue;
+ 
+      // Dedupe por serie, no por URL exacta: la portada suele enlazar la
+      // misma serie varias veces (una por cada capítulo reciente listado).
+      const id = `/manga/${slug}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+ 
+      results.push({
+        id,
+        title,
+        cover: absoluteUrl(imgMatch?.[1]),
+      });
     }
  
     return results;
@@ -120,11 +177,22 @@ const plugin = {
     if (!Array.isArray(json)) return [];
  
     const page = json.slice(offset, offset + PAGE_SIZE);
-    const results = [];
  
-    if (json.length <= 6) {
-      // Pocos resultados: enriquecerlos abriendo cada ficha para sacar títulos alternativos.
-      for (const serie of page) {
+    if (json.length > 6) {
+      return page.map((serie) => ({
+        id: serie.link,
+        title: serie.label,
+        cover: absoluteUrl(serie.thumbnail),
+      }));
+    }
+ 
+    // Pocos resultados: enriquecerlos abriendo cada ficha para sacar
+    // títulos alternativos. Antes esto se hacía uno a uno con await
+    // dentro del for; como mucho son 6 peticiones (harbor.http admite
+    // hasta 6 en paralelo), así que se lanzan todas juntas con Promise.all
+    // en vez de esperarlas en serie.
+    return Promise.all(
+      page.map(async (serie) => {
         const html = await fetchText(serie.link);
         const altTitle = html
           ?.match(/<span>Títulos Alternativos: <\/span>(.*?)<br>/s)?.[1]
@@ -132,24 +200,14 @@ const plugin = {
           .map((t) => t.trim())
           .join(", ");
  
-        results.push({
+        return {
           id: serie.link,
           title: serie.label,
           altTitle,
           cover: absoluteUrl(serie.thumbnail),
-        });
-      }
-    } else {
-      for (const serie of page) {
-        results.push({
-          id: serie.link,
-          title: serie.label,
-          cover: absoluteUrl(serie.thumbnail),
-        });
-      }
-    }
- 
-    return results;
+        };
+      }),
+    );
   },
  
   async detail(id) {
@@ -158,17 +216,29 @@ const plugin = {
  
     const titleMatch = html.match(/<title>(.*?)(?:\s*\|\s*leercapitulo\.co)?<\/title>/i);
     const coverMatch = html.match(/property="og:image"\s+content="([^"]+)"/i);
+ 
     const altTitle = html
       .match(/<span>Títulos Alternativos: <\/span>(.*?)<br>/s)?.[1]
       ?.split(", ")
       .map((t) => t.trim())
       .join(", ");
  
+    // Heurísticos sin confirmar contra HTML real (ver aviso al inicio del
+    // archivo). Si el sitio usa otras etiquetas para esto, ajustar aquí.
+    const descriptionMatch =
+      html.match(/property="og:description"\s+content="([^"]+)"/i) ||
+      html.match(/<span>\s*Sinopsis:?\s*<\/span>\s*(.*?)<\/(?:p|div)>/is);
+    const statusMatch = html.match(/<span>\s*Estado:?\s*<\/span>\s*(.*?)<\/(?:span|p|div)>/is);
+    const authorMatch = html.match(/<span>\s*Autor:?\s*<\/span>\s*(.*?)<\/(?:span|p|div)>/is);
+ 
     return {
       id,
       title: titleMatch ? titleMatch[1].trim() : id,
       altTitle,
       cover: absoluteUrl(coverMatch?.[1]),
+      description: stripTags(descriptionMatch?.[1]),
+      status: stripTags(statusMatch?.[1]),
+      author: stripTags(authorMatch?.[1]),
     };
   },
  
