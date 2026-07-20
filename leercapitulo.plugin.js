@@ -14,21 +14,21 @@ const plugin = {
         const doc = await harbor.parseHtml(res.body);
         const items = [];
 
-        doc.querySelectorAll(".manga-card, .manga-item").forEach(el => {
-            const link = el.querySelector("a");
+        doc.querySelectorAll("div").forEach(el => {
+            const link = el.querySelector("a[href*='/manga/']");
             const img = el.querySelector("img");
-            const title = el.querySelector("h3, .title")?.text()?.trim();
+            const title = el.querySelector("h3, h4, .title")?.text()?.trim();
 
-            if (link && title) {
+            if (link && title && img) {
                 items.push({
-                    id: link.attr("href") || "",
+                    id: link.attr("href"),
                     title: title,
-                    cover: img?.attr("src") || img?.attr("data-src") || "",
+                    cover: img.attr("src") || img.attr("data-src")
                 });
             }
         });
 
-        return items;
+        return items.slice(0, 30);
     },
 
     async search(query, offset = 0) {
@@ -38,16 +38,13 @@ const plugin = {
         const doc = await harbor.parseHtml(res.body);
         const items = [];
 
-        doc.querySelectorAll(".manga-card, .manga-item").forEach(el => {
-            const link = el.querySelector("a");
-            const img = el.querySelector("img");
-            const title = el.querySelector("h3, .title")?.text()?.trim();
-
-            if (link && title) {
+        doc.querySelectorAll("a[href*='/manga/']").forEach(link => {
+            const title = link.text().trim();
+            if (title) {
                 items.push({
-                    id: link.attr("href") || "",
+                    id: link.attr("href"),
                     title: title,
-                    cover: img?.attr("src") || img?.attr("data-src") || "",
+                    cover: ""
                 });
             }
         });
@@ -62,10 +59,10 @@ const plugin = {
         const doc = await harbor.parseHtml(res.body);
 
         return {
-            id: id,
-            title: doc.querySelector("h1.title-manga")?.text()?.trim() || "Sin título",
-            cover: doc.querySelector(".cover-detail img, img[src*='/covers/']")?.attr("src") || "",
-            description: doc.querySelector("#example2, .manga-collapse")?.text()?.trim(),
+            id,
+            title: doc.querySelector("h1")?.text()?.trim() || "Sin título",
+            cover: doc.querySelector("img[src*='/covers/']")?.attr("src") || "",
+            description: doc.querySelector("#example2, .manga-content p, .description")?.text()?.trim(),
             status: "Ongoing"
         };
     },
@@ -77,15 +74,13 @@ const plugin = {
         const doc = await harbor.parseHtml(res.body);
         const chapters = [];
 
-        doc.querySelectorAll(".chapter-list a.xanh, .chapter-list h4 a").forEach(link => {
-            const href = link.attr("href");
-            const title = link.text().trim();
-
-            if (href) {
+        doc.querySelectorAll("a[href*='/leer/']").forEach(link => {
+            const text = link.text().trim();
+            if (text.includes("Capitulo") || text.match(/\d+/)) {
                 chapters.push({
-                    id: href,
-                    chapter: title.match(/(\d+)/)?.[0] || "",
-                    title: title,
+                    id: link.attr("href"),
+                    chapter: text.match(/(\d+)/)?.[0] || "",
+                    title: text,
                     pages: 0,
                     language: "es"
                 });
@@ -104,7 +99,7 @@ const plugin = {
 
         doc.querySelectorAll("img").forEach(img => {
             let src = img.attr("src") || img.attr("data-src") || "";
-            if (src && (src.includes(".jpg") || src.includes(".png") || src.includes(".webp"))) {
+            if (src && /\.(jpg|jpeg|png|webp)/i.test(src)) {
                 if (!src.startsWith("http")) src = baseUrl + src;
                 urls.push(src);
             }
