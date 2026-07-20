@@ -1,0 +1,14 @@
+{
+  "name": "LeerCapítulo - Harbor Plugin",
+  "plugins": [
+    {
+      "id": "leercapitulo",
+      "name": "LeerCapítulo",
+      "version": "1.0.0",
+      "lang": "es",
+      "nsfw": false,
+      "icon": "https://www.leercapitulo.co/assets/3429f43e/mAaoVS/nDoD.png",
+      "entry": "leercapitulo.plugin.js"
+    }
+  ]
+}
