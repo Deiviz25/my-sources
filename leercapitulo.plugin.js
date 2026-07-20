@@ -6,6 +6,7 @@ const plugin = {
     id: "leercapitulo",
     name: "LeerCapítulo",
 
+    // ==================== POPULAR ====================
     async popular(offset = 0) {
         const page = Math.floor(offset / 48) + 1;
         const res = await harbor.http(`${baseUrl}/?page=${page}`, { responseType: "text" });
@@ -17,20 +18,24 @@ const plugin = {
         doc.querySelectorAll("div").forEach(el => {
             const link = el.querySelector("a[href*='/manga/']");
             const img = el.querySelector("img");
-            const title = el.querySelector("h3, h4, .title")?.text()?.trim();
+            const titleEl = el.querySelector("h3, h4, .title, a");
 
-            if (link && title && img) {
-                items.push({
-                    id: link.attr("href"),
-                    title: title,
-                    cover: img.attr("src") || img.attr("data-src")
-                });
+            if (link && titleEl && img) {
+                const title = titleEl.text().trim();
+                if (title.length > 2) {
+                    items.push({
+                        id: link.attr("href"),
+                        title: title,
+                        cover: img.attr("src") || img.attr("data-src") || ""
+                    });
+                }
             }
         });
 
-        return items.slice(0, 30);
+        return items;
     },
 
+    // ==================== SEARCH ====================
     async search(query, offset = 0) {
         const res = await harbor.http(`${baseUrl}/?s=${encodeURIComponent(query)}`, { responseType: "text" });
         if (!res.ok) return [];
@@ -40,7 +45,7 @@ const plugin = {
 
         doc.querySelectorAll("a[href*='/manga/']").forEach(link => {
             const title = link.text().trim();
-            if (title) {
+            if (title.length > 3) {
                 items.push({
                     id: link.attr("href"),
                     title: title,
@@ -52,6 +57,7 @@ const plugin = {
         return items;
     },
 
+    // ==================== DETAIL ====================
     async detail(id) {
         const res = await harbor.http(baseUrl + id, { responseType: "text" });
         if (!res.ok) return null;
@@ -59,14 +65,15 @@ const plugin = {
         const doc = await harbor.parseHtml(res.body);
 
         return {
-            id,
-            title: doc.querySelector("h1")?.text()?.trim() || "Sin título",
-            cover: doc.querySelector("img[src*='/covers/']")?.attr("src") || "",
-            description: doc.querySelector("#example2, .manga-content p, .description")?.text()?.trim(),
-            status: "Ongoing"
+            id: id,
+            title: doc.querySelector("h1.title-manga, h1")?.text()?.trim() || "Sin título",
+            cover: doc.querySelector("img[src*='/covers/'], .cover-detail img")?.attr("src") || "",
+            description: doc.querySelector("#example2, .manga-content p, .description, .manga-collapse")?.text()?.trim(),
+            status: doc.querySelector("span:contains('Estado')")?.parentNode?.textContent?.includes("Ongoing") ? "Ongoing" : "Completed"
         };
     },
 
+    // ==================== CHAPTERS ====================
     async chapters(id) {
         const res = await harbor.http(baseUrl + id, { responseType: "text" });
         if (!res.ok) return [];
@@ -74,12 +81,14 @@ const plugin = {
         const doc = await harbor.parseHtml(res.body);
         const chapters = [];
 
-        doc.querySelectorAll("a[href*='/leer/']").forEach(link => {
+        doc.querySelectorAll(".chapter-list a, a[href*='/leer/']").forEach(link => {
+            const href = link.attr("href");
             const text = link.text().trim();
-            if (text.includes("Capitulo") || text.match(/\d+/)) {
+
+            if (href && text) {
                 chapters.push({
-                    id: link.attr("href"),
-                    chapter: text.match(/(\d+)/)?.[0] || "",
+                    id: href,
+                    chapter: text.match(/\d+/)?.[0] || "",
                     title: text,
                     pages: 0,
                     language: "es"
@@ -90,6 +99,7 @@ const plugin = {
         return chapters.reverse();
     },
 
+    // ==================== PAGE URLS ====================
     async pageUrls(chapterId) {
         const res = await harbor.http(baseUrl + chapterId, { responseType: "text" });
         if (!res.ok) return [];
@@ -100,8 +110,10 @@ const plugin = {
         doc.querySelectorAll("img").forEach(img => {
             let src = img.attr("src") || img.attr("data-src") || "";
             if (src && /\.(jpg|jpeg|png|webp)/i.test(src)) {
-                if (!src.startsWith("http")) src = baseUrl + src;
-                urls.push(src);
+                if (!src.startsWith("http")) {
+                    src = baseUrl + (src.startsWith("/") ? "" : "/") + src;
+                }
+                if (!urls.includes(src)) urls.push(src);
             }
         });
 
