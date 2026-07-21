@@ -1,14 +1,23 @@
 {
-  "name": "LeerCapítulo - Harbor Plugin",
+  "name": "Mis Plugins para Harbor",
   "plugins": [
     {
       "id": "leercapitulo",
       "name": "LeerCapítulo",
+      "version": "1.0.1",
+      "lang": "es",
+      "nsfw": false,
+      "icon": "https://www.leercapitulo.co/favicon.ico",
+      "entry": "leercapitulo.plugin.js"
+    },
+    {
+      "id": "novelcool",
+      "name": "NovelCool",
       "version": "1.0.0",
       "lang": "es",
       "nsfw": false,
-      "icon": "https://www.leercapitulo.co/assets/3429f43e/mAaoVS/nDoD.png",
-      "entry": "leercapitulo.plugin.js"
+      "icon": "https://es.novelcool.com/favicon.ico",
+      "entry": "novelcool.plugin.js"
     }
   ]
 }
