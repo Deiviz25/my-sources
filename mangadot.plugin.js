@@ -1,4 +1,5 @@
 const BASE_URL = "https://mangadot.net";
+const API_URL = "https://mangadot.net/api";
 const PAGE_SIZE = 48;
 
 // --- helpers de red --------------------------------------------------------
@@ -107,7 +108,7 @@ const plugin = {
       ? chapters[chapters.length - 1].chapter
       : undefined;
 
-    const detailData = await fetchJson(`/api/manga/${encodeURIComponent(id)}`);
+    const detailData = await fetchJson(`${API_URL}/manga/${encodeURIComponent(id)}`);
     
     if (!detailData) {
       return {
@@ -121,42 +122,56 @@ const plugin = {
       };
     }
 
+    const statusMap = {
+      "Ongoing": "ongoing",
+      "Completed": "completed",
+      "on_hiatus": "hiatus",
+      "Hiatus": "hiatus",
+      "unknown": "unknown"
+    };
+
     return {
       id,
       title: detailData.title || id,
-      cover: absoluteUrl(detailData.cover),
-      description: detailData.description || undefined,
-      author: detailData.author || undefined,
-      status: detailData.status ? String(detailData.status).toLowerCase() : undefined,
+      cover: absoluteUrl(detailData.cover || detailData.photo),
+      description: decodeEntities(detailData.description) || undefined,
+      author: Array.isArray(detailData.authors) 
+        ? detailData.authors.join(" & ") 
+        : (detailData.author || undefined),
+      status: statusMap[detailData.status] || "unknown",
       lastChapter,
+      genres: Array.isArray(detailData.genres) ? detailData.genres : undefined,
     };
   },
 
   async chapters(id) {
-    const json = await fetchJson(`/api/manga/${encodeURIComponent(id)}/chapters/list?lang=en`);
+    const json = await fetchJson(`${API_URL}/manga/${encodeURIComponent(id)}/chapters/list?lang=en`);
     if (!json) return [];
 
     const items = Array.isArray(json) ? json : [];
     const found = [];
 
     for (const ch of items) {
-      const url = ch?.id != null ? String(ch.id) : "";
-      if (!url) continue;
+      const chapterId = ch?.id != null ? String(ch.id) : "";
+      if (!chapterId) continue;
 
       const chapNum = ch?.chapter_number != null ? String(ch.chapter_number) : "0";
       const chapTitle = ch?.chapter_title ? String(ch.chapter_title) : null;
+      const volumeNum = ch?.volume_number ? `Volume ${ch.volume_number} ` : "";
       const scanlator = 
         (ch?.scanlator_name && String(ch.scanlator_name).trim()) ||
         (ch?.group_name && String(ch.group_name).trim()) ||
-        "Default";
+        "Official";
 
       found.push({
-        id: url,
+        id: chapterId,
         chapter: chapNum,
-        title: chapTitle ? `Chapter ${chapNum} — ${chapTitle}` : `Chapter ${chapNum}`,
+        title: chapTitle 
+          ? `${volumeNum}Chapter ${chapNum} — ${chapTitle}` 
+          : `${volumeNum}Chapter ${chapNum}`,
         pages: 0,
         language: ch?.language ?? "en",
-        publishAt: ch?.published_at || undefined,
+        publishAt: ch?.date_added || ch?.published_at || undefined,
         scanlator,
       });
     }
@@ -165,7 +180,7 @@ const plugin = {
   },
 
   async pageUrls(chapterId) {
-    const json = await fetchJson(`/api/chapters/${encodeURIComponent(chapterId)}/images`);
+    const json = await fetchJson(`${API_URL}/chapters/${encodeURIComponent(chapterId)}/images`);
     if (!json) return [];
 
     const images = Array.isArray(json?.images) ? json.images : [];
@@ -176,7 +191,10 @@ const plugin = {
       if (!imgUrl) continue;
 
       const absolute = imgUrl.startsWith("http") ? imgUrl : `${BASE_URL}${imgUrl}`;
-      urls.push(absoluteUrl(absolute));
+      const absoluteImg = absoluteUrl(absolute);
+      if (absoluteImg) {
+        urls.push(absoluteImg);
+      }
     }
 
     return urls.filter(Boolean);
