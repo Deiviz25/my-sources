@@ -5,7 +5,7 @@
     {
       "id": "mangalect",
       "name": "MangaLect",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "lang": "es",
       "nsfw": false,
       "icon": "https://mangalect.org/static/lect_assets/images/favicon.3c4a81cddcab.png",
@@ -47,7 +47,5 @@
       "icon": "https://www.google.com/s2/favicons?sz=256&domain=https://comix.to",
       "entry": "comix.plugin.js"
     }
-  ]
-}
   ]
 }
