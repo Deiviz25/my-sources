@@ -70,9 +70,11 @@ async function fetchText(path) {
 
 async function fetchJson(url) {
   try {
-    // Con responseType "json", harbor.http devuelve el JSON YA parseado
-    // directamente (o null si no era válido) — NO {status, ok, body} como
-    // con "text". Por eso NO se comprueba .ok ni se lee .body aquí.
+    // OJO: con responseType "json", harbor.http devuelve el JSON YA
+    // parseado directamente (o null si no era JSON válido) — a diferencia
+    // de "text"/"base64", que sí devuelven {status, ok, headers, body}.
+    // Comprobar aquí .ok/.body como si fuera texto hacía que esta función
+    // devolviera null siempre, aunque la petición funcionara perfectamente.
     const json = await harbor.http(url, {
       responseType: "json",
       headers: { Referer: `${BASE_URL}/` },
@@ -345,22 +347,41 @@ const plugin = {
   // Confirmado: #chapter-list .chapter-card a.chapter-link[data-chapter][href],
   // con .chapter-title y .chapter-date. Viene en orden descendente en el HTML
   // (cap. más nuevo primero) -> se invierte para devolver ascendente.
+  //
+  // FIX: la ficha PAGINA los capítulos — solo trae un tramo por carga, con
+  // un botón <a id="more-link" href="?before=104.00"> para seguir bajando.
+  // Antes solo se leía la primera página (por eso mangas largos se cortaban
+  // a la mitad, p.ej. solo 101-150 de 192). Ahora se sigue ese enlace hasta
+  // que ya no aparece, acumulando todas las páginas.
   async chapters(id, cachedHtml) {
-    const html = cachedHtml || (await fetchText(`/info/${id}/`));
+    let html = cachedHtml || (await fetchText(`/info/${id}/`));
     if (!html) return [];
 
-    const found = [];
     const cardRe =
       /<a href="(\/lectura\/[^"]+\/)" class="chapter-link"\s+data-chapter="([^"]+)"[^>]*>[\s\S]*?<div class="chapter-title">([^<]*)<\/div>/g;
-    let m;
-    while ((m = cardRe.exec(html)) !== null) {
-      found.push({
-        id: m[1],
-        chapter: m[2],
-        title: decodeEntities(m[3]),
-        pages: 0, // el número de páginas no se expone en la ficha, solo en el capítulo
-        language: "es",
-      });
+    const moreLinkRe = /id="more-link"[^>]*href="\?before=([^"]+)"/;
+
+    const found = [];
+    let guard = 0; // límite de seguridad por si el "before" no avanza nunca
+
+    while (html && guard < 50) {
+      guard++;
+      let m;
+      cardRe.lastIndex = 0;
+      while ((m = cardRe.exec(html)) !== null) {
+        found.push({
+          id: m[1],
+          chapter: m[2],
+          title: decodeEntities(m[3]),
+          pages: 0, // el número de páginas no se expone en la ficha, solo en el capítulo
+          language: "es",
+        });
+      }
+
+      const moreMatch = html.match(moreLinkRe);
+      if (!moreMatch) break;
+
+      html = await fetchText(`/info/${id}/?before=${encodeURIComponent(moreMatch[1])}`);
     }
 
     return found.reverse();
