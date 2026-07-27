@@ -70,18 +70,17 @@ async function fetchText(path) {
 
 async function fetchJson(url) {
   try {
-    const res = await harbor.http(url, {
+    // Con responseType "json", harbor.http devuelve el JSON YA parseado
+    // directamente (o null si no era válido) — NO {status, ok, body} como
+    // con "text". Por eso NO se comprueba .ok ni se lee .body aquí.
+    const json = await harbor.http(url, {
       responseType: "json",
       headers: { Referer: `${BASE_URL}/` },
     });
-    if (!res.ok) {
-      harbor.log("fetchJson: status no-ok", res.status, url);
-      return null;
-    }
-    if (res.body === null) {
+    if (json === null) {
       harbor.log("fetchJson: body no es JSON válido", url);
     }
-    return res.body;
+    return json;
   } catch (e) {
     harbor.log("fetchJson: excepción", url, String(e));
     return null;
