@@ -9,17 +9,32 @@
 //   - Capítulo: <script> inline con Config.paginasRutas (array plano de rutas,
 //               SIN cifrado) + Config.B2_URL. Confirmado contra un capítulo real
 //               (he-perdido-la-cabeza-otra-vez / cap 1, 21 páginas).
+//   - Biblioteca: /api/buscar_mangas/?tipo=X&generos=Y&page=N&page_size=20
+//               Confirmado contra respuesta JSON real:
+//               { resultados: [{id, slug, titulo, portada, tipo, generos,
+//                 ultimo_capitulo, demografia}], page, page_size, total_pages,
+//                 total_results }
+//   - Géneros:  /biblioteca/ tiene el listado completo y estático en
+//               <button data-genero="Nombre">Nombre</button> dentro de
+//               .genre-selectors (65 géneros confirmados).
 //
-// ASUMIDO (sin HTML real que lo confirme):
+// ASUMIDO (sin HTML/red real que lo confirme):
 //   - search(): el endpoint es data-search-url="/api/api/busqueda-rapida/" (confirmado
 //     que existe), pero NO tengo la forma de su respuesta JSON (nombres de campo).
 //     Implementado con varios nombres de campo candidatos (title/titulo, cover/portada,
 //     etc.) por robustez, pero sin poder verificar cuál usa el sitio real.
-//   - tags(): no vi /listas/ ni un listado completo de géneros del sitio. Lo construyo
-//     recolectando los .genero-item que aparecen en fichas ya visitadas, lo cual es
-//     incompleto por diseño. Si tienes el HTML de /listas/, lo cierro bien.
-//   - Paginación de /biblioteca/ (para popular() con offset>0): no confirmada. Por
-//     ahora offset>0 devuelve [] en vez de arriesgarme a repetir contenido.
+//     NOTA: podría compartir estructura con /api/buscar_mangas/ (resultados/titulo/
+//     portada/slug), pero no está confirmado — no unificar sin verificar primero.
+//   - Filtro por "capitulos" (10+/30+/50+/100+) en /api/buscar_mangas/: se ve el
+//     parámetro en los botones del HTML pero no se capturó una petición de red
+//     real con ese filtro activo. Implementado pasando el parámetro "capitulos"
+//     tal cual, asumiendo que el backend lo acepta igual que tipo/generos.
+//   - "tipo" con valores distintos de "Manga": solo se confirmó tipo=Manga en la
+//     petición de red. Se asume que Manhwa/Manhua/Novela siguen el mismo patrón.
+//   - URL base de portadas para /api/buscar_mangas/: la respuesta trae rutas
+//     relativas ("portadas/x.webp"). Se asume la misma base que usa
+//     ssr-trends-data (https://images.mangalect.org/file/leermangaesp/), pero
+//     NO se confirmó específicamente para este endpoint.
 //   - status(): solo vi "En curso" en la ficha de ejemplo. Mapeo por keyword;
 //     "completado"/"finalizado" no están confirmados contra HTML real.
 //
@@ -30,8 +45,14 @@
 //
 // ⚠️ La lista de capítulos viene en orden descendente (más nuevo primero) en el
 // HTML — se invierte en chapters() para devolverla ascendente.
+//
+// ⚠️ Los géneros en /api/buscar_mangas/ vienen mezclados español/inglés y con
+// duplicados de facto (p.ej. "Fantasía"/"Fantasia", "Acción"/"Accion") en el
+// campo generos de cada manga individual. Esto es un dato del sitio, no un bug
+// del plugin — no se normaliza aquí para no inventar un mapeo no confirmado.
 
 const BASE_URL = "https://mangalect.org";
+const LIBRARY_PAGE_SIZE = 20; // Confirmado: page_size usado en la petición real capturada.
 
 // --- Helpers de red y utilidades -------------------------------------------
 
@@ -159,56 +180,85 @@ function dedupeCardsBySlug(cards) {
   return out;
 }
 
+// --- Biblioteca (/api/buscar_mangas/) ---------------------------------------
+// Confirmado contra respuesta JSON real (petición de red capturada por el
+// usuario): { resultados: [...], page, page_size, total_pages, total_results }
+
+function coverUrlFromPortada(portada) {
+  if (!portada) return undefined;
+  // ASUMIDO: misma base que ssr-trends-data, no confirmada específicamente
+  // para este endpoint, pero consistente con el resto del sitio.
+  return absoluteUrl(`https://images.mangalect.org/file/leermangaesp/${portada}`);
+}
+
+function mapResultadoToCard(item) {
+  return {
+    id: item.slug,
+    title: decodeEntities(item.titulo),
+    cover: coverUrlFromPortada(item.portada),
+  };
+}
+
+// tipo, generos y capitulos son opcionales. page es 1-indexed.
+async function fetchLibraryPage({ page, tipo, generos, capitulos }) {
+  const params = new URLSearchParams();
+  if (tipo) params.set("tipo", tipo);
+  if (generos) params.set("generos", generos);
+  if (capitulos) params.set("capitulos", capitulos); // ASUMIDO: no confirmado contra red real
+  params.set("page", String(page));
+  params.set("page_size", String(LIBRARY_PAGE_SIZE));
+
+  const json = await fetchJson(`${BASE_URL}/api/buscar_mangas/?${params.toString()}`);
+  if (!json || !Array.isArray(json.resultados)) return { cards: [], hasMore: false };
+
+  return {
+    cards: json.resultados.map(mapResultadoToCard),
+    hasMore: (json.page || page) < (json.total_pages || 1),
+  };
+}
+
 // --- MangaProvider -----------------------------------------------------
 
 const plugin = {
   id: "mangalect",
   name: "MangaLect",
 
-  // Confirmado: la home no expone paginación real conocida (no vi ?page=N
-  // en biblioteca todavía). offset > 0 devuelve [] para no repetir contenido.
+  // offset 0: usa la home (tendencias/destacados), igual que antes.
+  // offset > 0 (o si la home falla): pagina de verdad contra /api/buscar_mangas/,
+  // confirmado con page = floor(offset / LIBRARY_PAGE_SIZE) + 1.
   async popular(offset, tagId) {
     if (tagId) return plugin._byGenre(tagId, offset);
-    if (offset > 0) return [];
 
-    const html = await fetchText("/");
-    if (!html) return [];
-
-    // Prioriza el JSON de tendencias (más fiable); si falla, cae a regex del DOM.
-    let cards = parseTrendsJson(html);
-    if (cards.length === 0) {
-      cards = dedupeCardsBySlug([
-        ...parseFeaturedCards(html),
-        ...parseMangaCards(html),
-      ]);
+    if (offset === 0) {
+      const html = await fetchText("/");
+      if (html) {
+        let cards = parseTrendsJson(html);
+        if (cards.length === 0) {
+          cards = dedupeCardsBySlug([
+            ...parseFeaturedCards(html),
+            ...parseMangaCards(html),
+          ]);
+        }
+        if (cards.length > 0) {
+          return cards.map((c) => ({
+            id: slugFromInfoHref(c.href),
+            title: c.title,
+            cover: absoluteUrl(c.cover),
+          }));
+        }
+      }
     }
 
-    return cards.map((c) => ({
-      id: slugFromInfoHref(c.href),
-      title: c.title,
-      cover: absoluteUrl(c.cover),
-    }));
+    const page = Math.floor(offset / LIBRARY_PAGE_SIZE) + 1;
+    const { cards } = await fetchLibraryPage({ page });
+    return cards;
   },
 
-  // ASUMIDO: no tengo HTML real de /biblioteca/?generos=X para confirmar que
-  // esta ruta devuelve tarjetas con el mismo markup que la home. Lo sé porque
-  // el enlace de género en la ficha apunta a /biblioteca/?generos={nombre},
-  // pero no vi el resultado. Si no trae nada, revisar contra HTML real.
+  // Confirmado: /api/buscar_mangas/?generos=X&page=N&page_size=20
   async _byGenre(tagId, offset) {
-    if (offset > 0) return [];
-    const html = await fetchText(`/biblioteca/?generos=${encodeURIComponent(tagId)}`);
-    if (!html) return [];
-
-    const cards = dedupeCardsBySlug([
-      ...parseFeaturedCards(html),
-      ...parseMangaCards(html),
-    ]);
-
-    return cards.map((c) => ({
-      id: slugFromInfoHref(c.href),
-      title: c.title,
-      cover: absoluteUrl(c.cover),
-    }));
+    const page = Math.floor(offset / LIBRARY_PAGE_SIZE) + 1;
+    const { cards } = await fetchLibraryPage({ page, generos: tagId });
+    return cards;
   },
 
   // ASUMIDO: confirmé la URL del endpoint (data-search-url) pero no la forma
@@ -224,7 +274,7 @@ const plugin = {
 
     const rawList = Array.isArray(json)
       ? json
-      : json.results || json.data || json.items || [];
+      : json.resultados || json.results || json.data || json.items || [];
 
     const results = [];
     for (const item of rawList) {
@@ -248,13 +298,7 @@ const plugin = {
       results.push({
         id,
         title: decodeEntities(title),
-        cover: cover
-          ? absoluteUrl(
-              cover.startsWith("http")
-                ? cover
-                : `https://images.mangalect.org/file/leermangaesp/${cover}`,
-            )
-          : undefined,
+        cover: cover ? coverUrlFromPortada(cover.startsWith("http") ? undefined : cover) || absoluteUrl(cover) : undefined,
       });
     }
 
@@ -369,26 +413,28 @@ const plugin = {
     return urls.length ? [...new Set(urls.map(absoluteUrl))] : [];
   },
 
-  // ASUMIDO/INCOMPLETO: sin HTML de /listas/ solo puedo devolver los géneros
-  // vistos en la home + ficha (#info-generos a.genero-item). El id es el
-  // nombre del género tal como aparece en el query param ?generos=, ya que
-  // no confirmé que exista un slug numérico o distinto.
+  // Confirmado contra HTML real de /biblioteca/: los géneros están en botones
+  // estáticos <button data-genero="Nombre">Nombre</button> dentro de
+  // .genre-selectors. Lista completa (65 géneros vistos), a diferencia de la
+  // versión anterior que dependía de fichas ya visitadas y de un selector
+  // (.genre-pill) que no existe en el sitio real.
+  // El id es el valor exacto de data-genero, que es el mismo string que espera
+  // el parámetro ?generos= de /api/buscar_mangas/.
   async tags() {
-    const html = await fetchText("/");
-    if (!html) return [];
-
-    const tags = [];
-    const seen = new Set();
-    const genreRe = /<span class="genre-pill">([^<]+)<\/span>/g;
-    let m;
-    while ((m = genreRe.exec(html)) !== null) {
-      const name = decodeEntities(m[1]);
-      if (seen.has(name)) continue;
-      seen.add(name);
-      tags.push({ id: name, name });
-    }
-
-    return tags;
+    return [
+      "Acción", "Animación", "Apocalíptico", "Artes marciales", "Automóviles",
+      "Aventura", "Boys Love", "Ciberpunk", "Ciencia Ficción", "Comedia",
+      "Crimen", "Demonios", "Deporte", "Deportes", "Doujinshi", "Drama",
+      "Ecchi", "Espacio exterior", "Extranjero", "Familia", "Fantasía",
+      "Género Bender", "Girls Love", "Gore", "Guerra", "Harem", "Historia",
+      "Histórico", "Horror", "Isekai", "Josei", "Juegos", "Locura", "Magia",
+      "Mecha", "Militar", "Misterio", "Música", "Niños", "Oeste", "Parodia",
+      "Policía", "Policiaco", "Psicológico", "Realidad", "Realidad Virtual",
+      "Recuentos de la vida", "Reencarnación", "Romance", "Samurai", "Seinen",
+      "Shoujo", "Shoujo Ai", "Shounen", "Sobrenatural", "Superpoderes",
+      "Supervivencia", "Suspenso", "Telenovela", "Terror", "Thriller",
+      "Tragedia", "Traps", "Vampiros", "Vida escolar",
+    ].map((name) => ({ id: name, name }));
   },
 };
 
