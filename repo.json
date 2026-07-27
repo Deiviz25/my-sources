@@ -27,6 +27,15 @@
       "nsfw": false,
       "icon": "https://mangadot.net/mangadotnet-purple.svg",
       "entry": "mangadot.plugin.js"
+    },
+    {
+      "id": "comix",
+      "name": "Comix",
+      "version": "1.0.0",
+      "lang": "en",
+      "nsfw": true,
+      "icon": "https://www.google.com/s2/favicons?sz=256&domain=https://comix.to",
+      "entry": "comix.plugin.js"
     }
   ]
 }
