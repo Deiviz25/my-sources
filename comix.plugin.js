@@ -251,14 +251,8 @@ function generateComixHash(path) {
 
 // --- helpers de red --------------------------------------------------------
 
-async function fetchJson(urlOrPath) {
-    const full = urlOrPath.startsWith("http") ? urlOrPath : `${API_URL}${urlOrPath}`;
-    const res = await harbor.http(full, {
-        responseType: "json",
-        headers: {
-            Referer: `${BASE_URL}/`,
-        },
-    });
+async function fetchJson(path) {
+    const res = await harbor.http(path, { responseType: "json" });
     if (!res.ok) return null;
     return res.body;
 }
@@ -285,74 +279,14 @@ function decodeEntities(str) {
 
 // --- helpers de parsing --------------------------------------------------------
 
-function extractTitleSlug(url) {
-    if (!url) return "";
-    const value = String(url);
-    const marker = "/title/";
-    const slug = value.indexOf(marker) >= 0
-        ? value.slice(value.indexOf(marker) + marker.length)
-        : value.replace(/^\/?title\//, "").replace(/^\/+/, "");
-    return slug.split(/[/?#]/)[0] || "";
-}
-
-function slugWithoutHash(hashId, slug) {
-    const cleanSlug = String(slug || "").trim().replace(/^\/+/, "");
-    if (!cleanSlug) return "";
-    if (cleanSlug === hashId) return "";
-    return cleanSlug.indexOf(`${hashId}-`) === 0 ? cleanSlug.slice(hashId.length + 1) : cleanSlug;
-}
-
-function normalizeMangaId(mangaId) {
-    const rawId = String(mangaId || "").trim();
-    const parts = rawId.split("|");
-
-    let hashId = parts[0] || "";
-    let slug = parts[1] || "";
-
-    if (rawId.indexOf("|") < 0 && rawId.indexOf("-") > 0) {
-        hashId = rawId.split("-")[0];
-        slug = rawId.slice(hashId.length + 1);
-    }
-
-    slug = slugWithoutHash(hashId, slug);
-
-    return {
-        hashId,
-        slug,
-        fullSlug: slug ? `${hashId}-${slug}` : hashId,
-    };
-}
-
-function extractSlugFromItem(item, hashId) {
-    return slugWithoutHash(hashId, item.slug || extractTitleSlug(item.url));
-}
-
-function normalizeSynonyms(value) {
-    if (!Array.isArray(value)) return [];
-    return value
-        .map((item) => {
-            if (typeof item === "string") return item;
-            return item && item.title ? String(item.title) : "";
-        })
-        .filter((item) => item.length > 0);
-}
-
 function getPosterUrl(item) {
     const poster = item.poster || {};
     return poster.large || poster.medium || poster.small || "";
 }
 
-function getYear(item) {
-    const value = item.year || item.startDate;
-    const year = parseInt(value, 10);
-    return isNaN(year) ? undefined : year;
-}
-
-function getLastPage(result) {
-    const pagination = (result && (result.meta || result.pagination)) || {};
-    const lastPage = pagination.lastPage || pagination.last_page || 1;
-    const parsed = parseInt(lastPage, 10);
-    return isNaN(parsed) || parsed < 1 ? 1 : parsed;
+function extractSlugFromItem(item, hashId) {
+    const slug = item.slug || "";
+    return slug;
 }
 
 function formatChapterNumber(value) {
@@ -367,12 +301,6 @@ function extractChapterNumber(chapterStr) {
     }
     const match = chapterStr.match(/(\d+(?:\.\d+)?)/);
     return match ? parseFloat(match[1]) : 0;
-}
-
-function extractChapterId(chapterId) {
-    const parts = chapterId.split("|");
-    const num = parseInt(parts[2], 10);
-    return isNaN(num) ? 0 : num;
 }
 
 // --- MangaProvider -------------------------------------------------------
@@ -394,86 +322,32 @@ const plugin = {
     async search(query, offset, tagId) {
         if (!query && tagId) return plugin._byGenre(tagId, offset);
 
-        try {
-            const url = `${API_URL}/manga?keyword=${encodeURIComponent(query)}&order[relevance]=desc&limit=${PAGE_SIZE}&page=1`;
-            const data = await fetchJson(url);
-            
-            if (!data || !data.result || !data.result.items) return [];
+        const url = `${API_URL}/manga?keyword=${encodeURIComponent(query)}&order[relevance]=desc&limit=${PAGE_SIZE}&page=1`;
+        const data = await fetchJson(url);
+        
+        if (!data || !data.result || !data.result.items) return [];
 
-            const items = data.result.items;
-            const mangas = [];
+        const items = data.result.items;
+        const mangas = [];
 
-            for (const item of items) {
-                const hashId = item.hid || item.hash_id;
-                if (!hashId) continue;
+        for (const item of items) {
+            const hashId = item.hid || item.hash_id;
+            if (!hashId) continue;
 
-                const slug = extractSlugFromItem(item, hashId);
-                const compositeId = `${hashId}|${slug}`;
-
-                mangas.push({
-                    id: compositeId,
-                    title: decodeEntities(item.title || slug || hashId),
-                    cover: absoluteUrl(getPosterUrl(item)),
-                });
-            }
-
-            return mangas.slice(offset, offset + PAGE_SIZE);
-        } catch (e) {
-            return [];
+            mangas.push({
+                id: hashId,
+                title: decodeEntities(item.title || hashId),
+                cover: absoluteUrl(getPosterUrl(item)),
+            });
         }
+
+        return mangas.slice(offset, offset + PAGE_SIZE);
     },
 
     async detail(id) {
-        try {
-            const manga = normalizeMangaId(id);
-            const hashId = manga.hashId;
+        const hashId = String(id).split("|")[0];
 
-            if (!hashId) {
-                return {
-                    id,
-                    title: id,
-                    cover: undefined,
-                    description: undefined,
-                    author: undefined,
-                    status: undefined,
-                    lastChapter: undefined,
-                };
-            }
-
-            const chapters = await plugin.chapters(id);
-            const lastChapter = chapters.length
-                ? chapters[chapters.length - 1].chapter
-                : undefined;
-
-            const path = `/manga/${hashId}`;
-            const token = generateComixHash(path);
-            const data = await fetchJson(`${API_URL}${path}?_=${encodeURIComponent(token)}`);
-
-            if (!data || !data.result) {
-                return {
-                    id,
-                    title: id,
-                    cover: undefined,
-                    description: undefined,
-                    author: undefined,
-                    status: undefined,
-                    lastChapter,
-                };
-            }
-
-            const item = data.result;
-
-            return {
-                id,
-                title: decodeEntities(item.title || id),
-                cover: absoluteUrl(getPosterUrl(item)),
-                description: decodeEntities(item.description || item.synopsis) || undefined,
-                author: item.author || item.authors?.[0] || undefined,
-                status: item.status ? item.status.toLowerCase() : undefined,
-                lastChapter,
-                genres: Array.isArray(item.genres) ? item.genres : undefined,
-            };
-        } catch (e) {
+        if (!hashId) {
             return {
                 id,
                 title: id,
@@ -484,107 +358,119 @@ const plugin = {
                 lastChapter: undefined,
             };
         }
+
+        const chapters = await plugin.chapters(id);
+        const lastChapter = chapters.length
+            ? chapters[chapters.length - 1].chapter
+            : undefined;
+
+        const path = `/manga/${hashId}`;
+        const token = generateComixHash(path);
+        const data = await fetchJson(`${API_URL}${path}?_=${encodeURIComponent(token)}`);
+
+        if (!data || !data.result) {
+            return {
+                id,
+                title: id,
+                cover: undefined,
+                description: undefined,
+                author: undefined,
+                status: undefined,
+                lastChapter,
+            };
+        }
+
+        const item = data.result;
+
+        return {
+            id,
+            title: decodeEntities(item.title || id),
+            cover: absoluteUrl(getPosterUrl(item)),
+            description: decodeEntities(item.description || item.synopsis) || undefined,
+            author: item.author || undefined,
+            status: item.status ? item.status.toLowerCase() : undefined,
+            lastChapter,
+        };
     },
 
     async chapters(id) {
-        try {
-            const manga = normalizeMangaId(id);
-            const hashId = manga.hashId;
-            const slug = manga.slug;
-            const fullSlug = manga.fullSlug;
+        const hashId = String(id).split("|")[0];
 
-            if (!hashId) return [];
+        if (!hashId) return [];
 
-            const path = `/manga/${hashId}/chapters`;
-            const token = generateComixHash(path);
-            const url = `${API_URL}${path}?order[number]=desc&limit=100&page=1&_=${encodeURIComponent(token)}&mangaSlug=${encodeURIComponent(fullSlug)}`;
-            
-            const firstData = await fetchJson(url);
-            if (!firstData || !firstData.result || !firstData.result.items) return [];
+        const path = `/manga/${hashId}/chapters`;
+        const token = generateComixHash(path);
+        const url = `${API_URL}${path}?order[number]=desc&limit=100&page=1&_=${encodeURIComponent(token)}`;
+        
+        const firstData = await fetchJson(url);
+        if (!firstData || !firstData.result || !firstData.result.items) return [];
 
-            const allChapters = firstData.result.items.slice();
+        const allChapters = firstData.result.items.slice();
 
-            const chapters = [];
+        const chapters = [];
 
-            for (const item of allChapters) {
-                if (item.language && item.language.toLowerCase() !== "en" && item.language.toLowerCase() !== "english") {
-                    continue;
-                }
-
-                const chapterId = item.id != null ? item.id : item.chapter_id;
-                const chapterNumber = item.number != null
-                    ? formatChapterNumber(item.number)
-                    : (item.chapter || item.chap || "");
-
-                if (!chapterId || !chapterNumber) continue;
-
-                const chapterTitle = item.name && item.name.trim().length > 0
-                    ? `Chapter ${chapterNumber}: ${item.name}`
-                    : `Chapter ${chapterNumber}`;
-
-                const group = item.group || item.scanlation_group;
-                const isOfficial = item.isOfficial === true || item.isOfficial === 1 || item.is_official === true || item.is_official === 1;
-                const scanlator = group && group.name
-                    ? group.name.trim()
-                    : (isOfficial ? "Official" : undefined);
-
-                chapters.push({
-                    id: `${hashId}|${slug}|${chapterId}|${chapterNumber}`,
-                    chapter: chapterNumber,
-                    title: chapterTitle,
-                    pages: 0,
-                    language: "en",
-                    publishAt: item.updatedAtFormatted || item.createdAtFormatted || (item.updated_at ? item.updated_at.toString() : undefined),
-                    scanlator,
-                });
+        for (const item of allChapters) {
+            if (item.language && item.language.toLowerCase() !== "en" && item.language.toLowerCase() !== "english") {
+                continue;
             }
 
-            chapters.sort((a, b) => {
-                const chapterDiff = extractChapterNumber(a.chapter) - extractChapterNumber(b.chapter);
-                if (chapterDiff !== 0) return chapterDiff;
-                return extractChapterId(a.id) - extractChapterId(b.id);
-            });
+            const chapterId = item.id != null ? item.id : item.chapter_id;
+            const chapterNumber = item.number != null
+                ? formatChapterNumber(item.number)
+                : (item.chapter || item.chap || "");
 
-            chapters.forEach((chapter, index) => {
-                chapter.index = index;
-            });
+            if (!chapterId || !chapterNumber) continue;
 
-            return chapters;
-        } catch (e) {
-            return [];
+            const chapterTitle = item.name && item.name.trim().length > 0
+                ? `Chapter ${chapterNumber}: ${item.name}`
+                : `Chapter ${chapterNumber}`;
+
+            const group = item.group || item.scanlation_group;
+            const isOfficial = item.isOfficial === true || item.isOfficial === 1 || item.is_official === true || item.is_official === 1;
+            const scanlator = group && group.name
+                ? group.name.trim()
+                : (isOfficial ? "Official" : undefined);
+
+            chapters.push({
+                id: String(chapterId),
+                chapter: chapterNumber,
+                title: chapterTitle,
+                pages: 0,
+                language: "en",
+                publishAt: item.updatedAtFormatted || item.createdAtFormatted || (item.updated_at ? item.updated_at.toString() : undefined),
+                scanlator,
+            });
         }
+
+        chapters.sort((a, b) => {
+            return extractChapterNumber(b.chapter) - extractChapterNumber(a.chapter);
+        });
+
+        return chapters;
     },
 
     async pageUrls(chapterId) {
-        try {
-            const parts = String(chapterId || "").split("|");
-            const rawChapterId = parts.length >= 3
-                ? parts[2]
-                : String(chapterId || "").split("/").pop();
-            const specificChapterId = String(rawChapterId || "").split("-")[0];
+        const specificChapterId = String(chapterId).split("|")[0];
 
-            if (!specificChapterId) return [];
+        if (!specificChapterId) return [];
 
-            const path = `/chapters/${specificChapterId}`;
-            const token = generateComixHash(path);
-            const data = await fetchJson(`${API_URL}${path}?_=${encodeURIComponent(token)}`);
+        const path = `/chapters/${specificChapterId}`;
+        const token = generateComixHash(path);
+        const data = await fetchJson(`${API_URL}${path}?_=${encodeURIComponent(token)}`);
 
-            if (!data || !data.result) return [];
+        if (!data || !data.result) return [];
 
-            const result = data.result;
-            const images = result.pages || result.images || [];
+        const result = data.result;
+        const images = result.pages || result.images || [];
 
-            const urls = [];
-            for (const img of images) {
-                if (img && img.url) {
-                    urls.push(absoluteUrl(img.url));
-                }
+        const urls = [];
+        for (const img of images) {
+            if (img && img.url) {
+                urls.push(absoluteUrl(img.url));
             }
-
-            return urls.filter(Boolean);
-        } catch (e) {
-            return [];
         }
+
+        return urls.filter(Boolean);
     },
 
     async tags() {
