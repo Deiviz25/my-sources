@@ -18,25 +18,24 @@
 //               <button data-genero="Nombre">Nombre</button> dentro de
 //               .genre-selectors (65 géneros confirmados).
 //
+// CONFIRMADO (con captura de red real, ya no es una suposición):
+//   - search(): /api/api/busqueda-rapida/?q=... devuelve la misma forma que
+//     /api/buscar_mangas/ (resultados/slug/titulo/portada, portada absoluta).
+//
 // ASUMIDO (sin HTML/red real que lo confirme):
-//   - search(): el endpoint es data-search-url="/api/api/busqueda-rapida/" (confirmado
-//     que existe), pero NO tengo la forma de su respuesta JSON (nombres de campo).
-//     Implementado con varios nombres de campo candidatos (title/titulo, cover/portada,
-//     etc.) por robustez, pero sin poder verificar cuál usa el sitio real.
-//     NOTA: podría compartir estructura con /api/buscar_mangas/ (resultados/titulo/
-//     portada/slug), pero no está confirmado — no unificar sin verificar primero.
-//   - Filtro por "capitulos" (10+/30+/50+/100+) en /api/buscar_mangas/: se ve el
 //     parámetro en los botones del HTML pero no se capturó una petición de red
 //     real con ese filtro activo. Implementado pasando el parámetro "capitulos"
 //     tal cual, asumiendo que el backend lo acepta igual que tipo/generos.
 //   - "tipo" con valores distintos de "Manga": solo se confirmó tipo=Manga en la
 //     petición de red. Se asume que Manhwa/Manhua/Novela siguen el mismo patrón.
-//   - URL base de portadas para /api/buscar_mangas/: la respuesta trae rutas
-//     relativas ("portadas/x.webp"). Se asume la misma base que usa
-//     ssr-trends-data (https://images.mangalect.org/file/leermangaesp/), pero
-//     NO se confirmó específicamente para este endpoint.
+//   - URL base de portadas para /api/buscar_mangas/: CONFIRMADO que "portada"
+//     puede venir ya como URL absoluta (https://images.mangalect.org/...). Se
+//     mantiene un fallback (prefijo ssr-trends-data) por si algún resultado
+//     trajera ruta relativa, sin confirmar ese caso específico.
 //   - status(): solo vi "En curso" en la ficha de ejemplo. Mapeo por keyword;
 //     "completado"/"finalizado" no están confirmados contra HTML real.
+//   - "tipo": CONFIRMADO contra red real con varios valores (manga, manhua,
+//     manhwa, novela), todos siguiendo el mismo patrón de resultado.
 //
 // ⚠️ LÍMITE CONOCIDO: el capítulo de ejemplo (21 páginas) no muestra CDN con
 // protección por Referer -- las imágenes cargan directo desde images.mangalect.org.
@@ -186,8 +185,11 @@ function dedupeCardsBySlug(cards) {
 
 function coverUrlFromPortada(portada) {
   if (!portada) return undefined;
-  // ASUMIDO: misma base que ssr-trends-data, no confirmada específicamente
-  // para este endpoint, pero consistente con el resto del sitio.
+  // Confirmado contra respuesta real: /api/buscar_mangas/ puede devolver
+  // "portada" ya como URL absoluta (https://images.mangalect.org/...). Si no
+  // lo es, se asume la misma base que ssr-trends-data (no confirmada
+  // específicamente para este endpoint, pero consistente con el resto del sitio).
+  if (portada.startsWith("http")) return absoluteUrl(portada);
   return absoluteUrl(`https://images.mangalect.org/file/leermangaesp/${portada}`);
 }
 
@@ -261,8 +263,8 @@ const plugin = {
     return cards;
   },
 
-  // ASUMIDO: confirmé la URL del endpoint (data-search-url) pero no la forma
-  // de su JSON. Pruebo varios nombres de campo candidatos por robustez.
+  // Confirmado contra respuesta real: misma forma que /api/buscar_mangas/
+  // (resultados/slug/titulo/portada, portada ya absoluta).
   async search(query, offset, tagId) {
     if (!query && tagId) return plugin._byGenre(tagId, offset);
     if (!query) return [];
@@ -270,44 +272,9 @@ const plugin = {
     const json = await fetchJson(
       `${BASE_URL}/api/api/busqueda-rapida/?q=${encodeURIComponent(query)}`,
     );
-    if (!json) return [];
+    if (!json || !Array.isArray(json.resultados)) return [];
 
-    const rawList = Array.isArray(json)
-      ? json
-      : json.resultados || json.results || json.data || json.items || [];
-
-    const results = [];
-    for (const item of rawList) {
-      // FIX: los candidatos podían no ser string (p.ej. un id numérico), lo
-      // que rompía slugOrHref.includes("/"). Forzamos a string primero.
-      const rawSlugOrHref =
-        item.slug ?? item.href ?? item.link ?? item.url;
-      if (rawSlugOrHref === undefined || rawSlugOrHref === null) continue;
-      const slugOrHref = String(rawSlugOrHref);
-      if (!slugOrHref) continue;
-
-      const id = slugOrHref.includes("/")
-        ? slugFromInfoHref(slugOrHref)
-        : slugOrHref;
-
-      const title = item.titulo || item.title || item.nombre || item.name;
-      if (!title) continue;
-
-      const cover =
-        item.portada || item.cover || item.image || item.img || item.thumbnail;
-
-      results.push({
-        id,
-        title: decodeEntities(title),
-        cover: cover
-          ? (String(cover).startsWith("http")
-              ? absoluteUrl(cover)
-              : coverUrlFromPortada(cover))
-          : undefined,
-      });
-    }
-
-    return results.slice(offset, offset + 24);
+    return json.resultados.slice(offset, offset + 24).map(mapResultadoToCard);
   },
 
   async detail(id) {
