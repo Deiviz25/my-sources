@@ -9,7 +9,7 @@
       "lang": "es",
       "nsfw": false,
       "icon": "https://mangalect.org/static/lect_assets/images/favicon.3c4a81cddcab.png",
-      "entry": "plugins/mangalect.js"
+      "entry": "plugins/mangalect.plugin.js"
     },
     {
       "id": "leercapitulo",
