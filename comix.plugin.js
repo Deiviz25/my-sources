@@ -1,5 +1,5 @@
 // MangaLect — Harbor MangaProvider plugin
-// Corregido con el catálogo completo (/biblioteca/) y la búsqueda rápida por API
+// Incluye extracción mejorada de páginas a partir de la configuración interna JS
 
 const BASE_URL = "https://mangalect.org";
 
@@ -62,7 +62,7 @@ async function parseBookCards(html) {
       }
     }
 
-    // Extraer imagen (priorizando data-src sobre base64)
+    // Extraer portada
     const img = a.querySelector("img");
     let cover;
     if (img) {
@@ -91,14 +91,12 @@ const plugin = {
   name: "MangaLect",
 
   async popular(offset, tagId) {
-    // Paginación sobre la biblioteca completa en lugar de la home
     const page = Math.floor(offset / 24) + 1;
     const path = `/biblioteca/?page=${page}`;
 
     const html = await fetchText(path);
     let cards = await parseBookCards(html);
 
-    // Fallback a portada si la biblioteca no devolvió datos en página 1
     if (cards.length === 0 && page === 1) {
       const homeHtml = await fetchText("/");
       cards = await parseBookCards(homeHtml);
@@ -112,17 +110,17 @@ const plugin = {
 
     const page = Math.floor(offset / 24) + 1;
 
-    // 1. Probar búsqueda en /biblioteca/?q=
+    // 1. Probar parámetro q= en biblioteca
     let html = await fetchText(`/biblioteca/?q=${encodeURIComponent(query)}&page=${page}`);
     let results = await parseBookCards(html);
 
-    // 2. Probar parámetro alternativo /biblioteca/?buscar=
+    // 2. Probar parámetro buscar= en biblioteca
     if (results.length === 0) {
       html = await fetchText(`/biblioteca/?buscar=${encodeURIComponent(query)}&page=${page}`);
       results = await parseBookCards(html);
     }
 
-    // 3. Fallback: Consulta a la API de búsqueda rápida (/api/api/busqueda-rapida/)
+    // 3. Fallback: Endpoint API de búsqueda rápida
     if (results.length === 0 && page === 1) {
       try {
         const apiRes = await harbor.http(`${BASE_URL}/api/api/busqueda-rapida/?q=${encodeURIComponent(query)}`, {
@@ -149,7 +147,7 @@ const plugin = {
           }
         }
       } catch (e) {
-        // Silenciar errores de API si no responde JSON
+        // Ignorar si la API no devuelve formato JSON válido
       }
     }
 
@@ -162,22 +160,18 @@ const plugin = {
 
     const doc = await harbor.parseHtml(html);
 
-    // Título
     const titleNode = doc.querySelector("h1.manga-title, h1");
     const title = titleNode ? decodeEntities(titleNode.text()) : "MangaLect";
 
-    // Portada
     const imgNode = doc.querySelector("img.manga-cover, .manga-cover-wrapper img, meta[property='og:image']");
     let cover;
     if (imgNode) {
       cover = imgNode.attr("src") || imgNode.attr("data-src") || imgNode.attr("content");
     }
 
-    // Sinopsis
     const descNode = doc.querySelector("#synopsis-text, .synopsis p");
     const description = descNode ? decodeEntities(descNode.text()) : undefined;
 
-    // Estado
     const statusNode = doc.querySelector(".status-text, .circle-state-indicator + span");
     const statusText = statusNode ? decodeEntities(statusNode.text()).toLowerCase() : "";
     let status;
@@ -187,7 +181,6 @@ const plugin = {
       status = "completed";
     }
 
-    // Capítulos
     const chapterList = await plugin.chapters(id, html);
     const lastChapter = chapterList.length ? chapterList[0].chapter : undefined;
 
@@ -244,43 +237,40 @@ const plugin = {
     const html = await fetchText(chapterId);
     if (!html) return [];
 
+    // Método 1: Extraer directamente de la configuración JS nativa de la página
+    const b2Match = html.match(/B2_URL:\s*"([^"]+)"/);
+    const routesMatch = html.match(/paginasRutas:\s*(\[[^\]]+\])/);
+
+    if (b2Match && routesMatch) {
+      try {
+        const b2Url = b2Match[1];
+        const routes = JSON.parse(routesMatch[1]);
+        if (Array.isArray(routes) && routes.length > 0) {
+          return routes.map(r => `${b2Url}/${r}`);
+        }
+      } catch (e) {
+        // En caso de fallo de sintaxis JSON, pasa al método por DOM
+      }
+    }
+
+    // Método 2: Extracción a través del DOM usando los contenedores de vista en cascada
     const doc = await harbor.parseHtml(html);
-    
-    const candidateSelectors = [
-      ".reader-images img",
-      ".reading-content img",
-      "#chapter-images img",
-      ".chapter-content img",
-      ".page-break img",
-      ".lectura-images img"
-    ];
-
-    for (const sel of candidateSelectors) {
-      const imgs = doc.querySelectorAll(sel);
-      if (imgs.length) {
-        const urls = imgs
-          .map((img) => {
-            const src = img.attr("data-src") || img.attr("src");
-            return (src && !src.startsWith("data:")) ? absoluteUrl(src) : null;
-          })
-          .filter(Boolean);
-        if (urls.length) return urls;
-      }
+    const imgs = doc.querySelectorAll("#cascade-view img, .cascade-page-container img, #page-by-page-view img");
+    if (imgs.length > 0) {
+      const urls = imgs
+        .map(img => img.attr("src") || img.attr("data-src"))
+        .filter(src => src && !src.startsWith("data:") && src.includes("pagina_"));
+      if (urls.length > 0) return [...new Set(urls.map(absoluteUrl))];
     }
 
-    // Fallback con Regex
-    const imgRe = /<img[^>]+(?:data-src|src)="([^"]+)"[^>]*>/gi;
-    const pages = [];
-    let m;
-
-    while ((m = imgRe.exec(html)) !== null) {
-      const src = m[1];
-      if (src && !src.startsWith("data:") && !src.includes("favicon") && !src.includes("logo") && !src.includes("brand")) {
-        pages.push(absoluteUrl(src));
-      }
+    // Método 3: Expresión regular sobre la CDN de imágenes de MangaLect
+    const imgRe = /https:\/\/images\.mangalect\.org\/file\/[^\s"']+\.(?:webp|jpg|png|jpeg)/gi;
+    const matches = html.match(imgRe);
+    if (matches) {
+      return [...new Set(matches)];
     }
 
-    return [...new Set(pages)];
+    return [];
   }
 };
 
