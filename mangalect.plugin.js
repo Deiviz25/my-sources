@@ -74,9 +74,16 @@ async function fetchJson(url) {
       responseType: "json",
       headers: { Referer: `${BASE_URL}/` },
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      harbor.log("fetchJson: status no-ok", res.status, url);
+      return null;
+    }
+    if (res.body === null) {
+      harbor.log("fetchJson: body no es JSON válido", url);
+    }
     return res.body;
   } catch (e) {
+    harbor.log("fetchJson: excepción", url, String(e));
     return null;
   }
 }
@@ -269,9 +276,10 @@ const plugin = {
     if (!query && tagId) return plugin._byGenre(tagId, offset);
     if (!query) return [];
 
-    const json = await fetchJson(
-      `${BASE_URL}/api/api/busqueda-rapida/?q=${encodeURIComponent(query)}`,
-    );
+    const url = `${BASE_URL}/api/api/busqueda-rapida/?q=${encodeURIComponent(query)}`;
+    harbor.log("search: pidiendo", url);
+    const json = await fetchJson(url);
+    harbor.log("search: respuesta", JSON.stringify(json));
     if (!json || !Array.isArray(json.resultados)) return [];
 
     return json.resultados.slice(offset, offset + 24).map(mapResultadoToCard);
