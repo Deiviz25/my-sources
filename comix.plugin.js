@@ -1,247 +1,196 @@
-const BASE_URL = "https://comix.to";
-const API_URL = "https://comix.to/api/v1";
-const PAGE_SIZE = 28;
+// MangaLect — Harbor MangaProvider plugin
+// Creado a partir del HTML de la portada de mangalect.org
 
-// --- helpers de red --------------------------------------------------------
+const BASE_URL = "https://mangalect.org";
 
-async function fetchJson(path) {
-    const res = await harbor.http(path, { responseType: "json" });
-    if (!res.ok) return null;
-    return res.body;
+// --- Helpers de red y utilidades -------------------------------------------
+
+async function fetchText(urlOrPath) {
+  const full = urlOrPath.startsWith("http") ? urlOrPath : `${BASE_URL}${urlOrPath}`;
+  const res = await harbor.http(full, { 
+    responseType: "text",
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Referer": `${BASE_URL}/`
+    }
+  });
+  if (!res.ok) return null;
+  return res.body;
 }
 
 function absoluteUrl(url) {
-    if (!url) return undefined;
-    try {
-        return new URL(url, BASE_URL).toString();
-    } catch (e) {
-        return undefined;
-    }
+  if (!url) return undefined;
+  try {
+    return new URL(url, BASE_URL).toString();
+  } catch (e) {
+    return undefined;
+  }
 }
 
 function decodeEntities(str) {
-    if (!str) return str;
-    return str
-        .replace(/&quot;/g, '"')
-        .replace(/&#0?39;/g, "'")
-        .replace(/&amp;/g, "&")
-        .replace(/&nbsp;/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
+  if (!str) return str;
+  return str
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-function getPosterUrl(item) {
-    const poster = item.poster || {};
-    return poster.large || poster.medium || poster.small || "";
+// --- Extracción de tarjetas de manga (Bento grid / listados) ---------------
+
+function parseCards(html) {
+  // Captura el enlace /info/..., la imagen data-src/src y el título <h3>
+  const cardRe = /<a\s+href="(\/info\/[^"]+)"[^>]*>[\s\S]*?<img[^>]+(?:data-src|src)="([^"]+)"[^>]*alt="([^"]*)"[\s\S]*?<h3>([^<]+)<\/h3>/g;
+  const seen = new Set();
+  const results = [];
+
+  let m;
+  while ((m = cardRe.exec(html)) !== null) {
+    const href = m[1];
+    const cover = m[2];
+    const title = decodeEntities(m[4] || m[3]);
+
+    if (!href || seen.has(href)) continue;
+    seen.add(href);
+
+    results.push({
+      id: href,
+      title: title,
+      cover: absoluteUrl(cover)
+    });
+  }
+
+  return results;
 }
 
-function formatChapterNumber(value) {
-    const str = String(value);
-    return str.endsWith(".0") ? str.slice(0, -2) : str;
-}
-
-function extractChapterNumber(chapterStr) {
-    const num = parseFloat(chapterStr);
-    if (!isNaN(num)) {
-        return num;
-    }
-    const match = chapterStr.match(/(\d+(?:\.\d+)?)/);
-    return match ? parseFloat(match[1]) : 0;
-}
-
-// --- MangaProvider -------------------------------------------------------
+// --- Plugin Harbor --------------------------------------------------------
 
 const plugin = {
-    id: "comix",
-    name: "Comix",
+  id: "mangalect",
+  name: "MangaLect",
 
-    async popular(offset, tagId) {
-        if (offset > 0) return [];
-        return [];
-    },
+  async popular(offset, tagId) {
+    // Si hay paginación offset > 0 se carga biblioteca
+    const page = Math.floor(offset / 20) + 1;
+    const path = page === 1 ? "/" : `/biblioteca/?page=${page}`;
+    
+    const html = await fetchText(path);
+    if (!html) return [];
 
-    async _byGenre(tagId, offset) {
-        if (offset > 0) return [];
-        return [];
-    },
+    return parseCards(html);
+  },
 
-    async search(query, offset, tagId) {
-        if (!query && tagId) return plugin._byGenre(tagId, offset);
+  async search(query, offset, tagId) {
+    if (!query) return plugin.popular(offset, tagId);
 
-        try {
-            const url = `${API_URL}/manga?keyword=${encodeURIComponent(query)}&order[relevance]=desc&limit=${PAGE_SIZE}&page=1`;
-            const data = await fetchJson(url);
-            
-            if (!data || !data.result || !data.result.items) return [];
+    const page = Math.floor(offset / 20) + 1;
+    const url = `/biblioteca/?q=${encodeURIComponent(query)}&page=${page}`;
+    
+    const html = await fetchText(url);
+    if (!html) return [];
 
-            const items = data.result.items;
-            const mangas = [];
+    return parseCards(html);
+  },
 
-            for (const item of items) {
-                const hashId = item.hid || item.hash_id;
-                if (!hashId) continue;
+  async detail(id) {
+    const html = await fetchText(id);
+    if (!html) return null;
 
-                mangas.push({
-                    id: String(hashId),
-                    title: decodeEntities(item.title || String(hashId)),
-                    cover: absoluteUrl(getPosterUrl(item)),
-                });
-            }
+    const doc = await harbor.parseHtml(html);
 
-            return mangas.slice(offset, offset + PAGE_SIZE);
-        } catch (e) {
-            return [];
-        }
-    },
+    // Título
+    const titleNode = doc.querySelector("h1, .manga-title, .title");
+    const title = titleNode ? decodeEntities(titleNode.text()) : "MangaLect";
 
-    async detail(id) {
-        try {
-            const hashId = String(id || "").split("|")[0];
+    // Portada
+    const imgNode = doc.querySelector(".manga-cover img, .info-cover img, meta[property='og:image']");
+    const cover = imgNode ? (imgNode.attr("data-src") || imgNode.attr("src") || imgNode.attr("content")) : undefined;
 
-            if (!hashId) {
-                return {
-                    id,
-                    title: id,
-                    cover: undefined,
-                    description: undefined,
-                    author: undefined,
-                    status: undefined,
-                    lastChapter: undefined,
-                };
-            }
+    // Sinopsis
+    const descNode = doc.querySelector(".synopsis, .description, .manga-description, #sinopsis");
+    const description = descNode ? decodeEntities(descNode.text()) : undefined;
 
-            const chapters = await plugin.chapters(id);
-            const lastChapter = chapters.length
-                ? chapters[chapters.length - 1].chapter
-                : undefined;
+    // Capítulos
+    const chapterList = await plugin.chapters(id, html);
+    const lastChapter = chapterList.length ? chapterList[0].chapter : undefined;
 
-            const url = `${API_URL}/manga/${hashId}`;
-            const data = await fetchJson(url);
+    return {
+      id,
+      title,
+      cover: absoluteUrl(cover),
+      description,
+      lastChapter
+    };
+  },
 
-            if (!data || !data.result) {
-                return {
-                    id,
-                    title: String(id),
-                    cover: undefined,
-                    description: undefined,
-                    author: undefined,
-                    status: undefined,
-                    lastChapter,
-                };
-            }
+  async chapters(id, cachedHtml) {
+    const html = cachedHtml || await fetchText(id);
+    if (!html) return [];
 
-            const item = data.result;
+    // Expresión regular para enlaces de lectura (/lectura/slug/capitulo/)
+    const chapRe = /<a\s+href="(\/lectura\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+    const found = [];
+    const seen = new Set();
 
-            return {
-                id,
-                title: decodeEntities(item.title || String(hashId)),
-                cover: absoluteUrl(getPosterUrl(item)),
-                description: decodeEntities(item.description || item.synopsis) || undefined,
-                author: item.author || undefined,
-                status: item.status ? item.status.toLowerCase() : undefined,
-                lastChapter,
-            };
-        } catch (e) {
-            return {
-                id,
-                title: String(id),
-                cover: undefined,
-                description: undefined,
-                author: undefined,
-                status: undefined,
-                lastChapter: undefined,
-            };
-        }
-    },
+    let m;
+    while ((m = chapRe.exec(html)) !== null) {
+      const url = m[1];
+      const text = decodeEntities(m[2].replace(/<[^>]+>/g, ""));
 
-    async chapters(id) {
-        try {
-            const hashId = String(id || "").split("|")[0];
+      if (seen.has(url)) continue;
+      seen.add(url);
 
-            if (!hashId) return [];
+      const numMatch = text.match(/Cap[íi]tulo\s+([\d.]+)/i) || url.match(/\/(\d+(\.\d+)?)\/?$/);
 
-            const url = `${API_URL}/manga/${hashId}/chapters?order[number]=desc&limit=100&page=1`;
-            
-            const firstData = await fetchJson(url);
-            if (!firstData || !firstData.result || !firstData.result.items) return [];
+      found.push({
+        id: url,
+        chapter: numMatch ? numMatch[1] : null,
+        title: text,
+        language: "es",
+        pages: 0
+      });
+    }
 
-            const allChapters = firstData.result.items.slice();
+    return found;
+  },
 
-            const chapters = [];
+  async pageUrls(chapterId) {
+    const html = await fetchText(chapterId);
+    if (!html) return [];
 
-            for (const item of allChapters) {
-                if (item.language && item.language.toLowerCase() !== "en" && item.language.toLowerCase() !== "english") {
-                    continue;
-                }
+    const doc = await harbor.parseHtml(html);
+    
+    // Selectores habituales para el visor de imágenes
+    const candidateSelectors = [
+      ".reader-images img",
+      ".reading-content img",
+      "#chapter-images img",
+      ".chapter-content img",
+      ".page-break img"
+    ];
 
-                const chapterId = item.id != null ? item.id : item.chapter_id;
-                const chapterNumber = item.number != null
-                    ? formatChapterNumber(item.number)
-                    : (item.chapter || item.chap || "");
+    for (const sel of candidateSelectors) {
+      const imgs = doc.querySelectorAll(sel);
+      if (imgs.length) {
+        return imgs
+          .map((img) => absoluteUrl(img.attr("data-src") || img.attr("src")))
+          .filter(Boolean);
+      }
+    }
 
-                if (!chapterId || !chapterNumber) continue;
+    // Heurística fallback por regex si las imágenes se inyectan en scripts o tags genéricos
+    const imgRe = /<img[^>]+(?:data-src|src)="([^"]+)"[^>]*class="[^"]*(?:page|chapter|reader)[^"]*"/gi;
+    const pages = [];
+    let m;
 
-                const chapterTitle = item.name && item.name.trim().length > 0
-                    ? `Chapter ${chapterNumber}: ${item.name}`
-                    : `Chapter ${chapterNumber}`;
+    while ((m = imgRe.exec(html)) !== null) {
+      pages.push(absoluteUrl(m[1]));
+    }
 
-                const group = item.group || item.scanlation_group;
-                const isOfficial = item.isOfficial === true || item.isOfficial === 1 || item.is_official === true || item.is_official === 1;
-                const scanlator = group && group.name
-                    ? group.name.trim()
-                    : (isOfficial ? "Official" : undefined);
-
-                chapters.push({
-                    id: String(chapterId),
-                    chapter: chapterNumber,
-                    title: chapterTitle,
-                    pages: 0,
-                    language: "en",
-                    publishAt: item.updatedAtFormatted || item.createdAtFormatted || (item.updated_at ? item.updated_at.toString() : undefined),
-                    scanlator,
-                });
-            }
-
-            chapters.sort((a, b) => {
-                return extractChapterNumber(b.chapter) - extractChapterNumber(a.chapter);
-            });
-
-            return chapters;
-        } catch (e) {
-            return [];
-        }
-    },
-
-    async pageUrls(chapterId) {
-        try {
-            const specificChapterId = String(chapterId || "").split("|")[0];
-
-            if (!specificChapterId) return [];
-
-            const url = `${API_URL}/chapters/${specificChapterId}/images`;
-            const data = await fetchJson(url);
-
-            if (!data || !data.result) return [];
-
-            const result = data.result;
-            const images = result.pages || result.images || [];
-
-            const urls = [];
-            for (const img of images) {
-                if (img && img.url) {
-                    urls.push(absoluteUrl(img.url));
-                }
-            }
-
-            return urls.filter(Boolean);
-        } catch (e) {
-            return [];
-        }
-    },
-
-    async tags() {
-        return [];
-    },
+    return pages;
+  }
 };
 
 harbor.register(plugin);
