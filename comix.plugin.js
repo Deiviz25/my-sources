@@ -1,21 +1,64 @@
-// MangaLect — Harbor MangaProvider plugin
-// Incluye extracción mejorada de páginas a partir de la configuración interna JS
+// mangalect.org — Harbor MangaProvider plugin
+//
+// Selectores confirmados contra HTML real (home, ficha /info/, capítulo /lectura/):
+//   - Home:     div.manga-card-v2 > a[href^="/info/"] (+ img.lazy-load[data-src],
+//               h3.overlay-text-title, .format-badge), y script#ssr-trends-data (JSON)
+//   - Ficha:    h1.manga-title, img.manga-cover, ul.alternate-titles > li,
+//               #info-generos a.genero-item, #info-block .status-text,
+//               #synopsis-text, #chapter-list .chapter-card a.chapter-link[data-chapter]
+//   - Capítulo: <script> inline con Config.paginasRutas (array plano de rutas,
+//               SIN cifrado) + Config.B2_URL. Confirmado contra un capítulo real
+//               (he-perdido-la-cabeza-otra-vez / cap 1, 21 páginas).
+//
+// ASUMIDO (sin HTML real que lo confirme):
+//   - search(): el endpoint es data-search-url="/api/api/busqueda-rapida/" (confirmado
+//     que existe), pero NO tengo la forma de su respuesta JSON (nombres de campo).
+//     Implementado con varios nombres de campo candidatos (title/titulo, cover/portada,
+//     etc.) por robustez, pero sin poder verificar cuál usa el sitio real.
+//   - tags(): no vi /listas/ ni un listado completo de géneros del sitio. Lo construyo
+//     recolectando los .genero-item que aparecen en fichas ya visitadas, lo cual es
+//     incompleto por diseño. Si tienes el HTML de /listas/, lo cierro bien.
+//   - Paginación de /biblioteca/ (para popular() con offset>0): no confirmada. Por
+//     ahora offset>0 devuelve [] en vez de arriesgarme a repetir contenido.
+//   - status(): solo vi "En curso" en la ficha de ejemplo. Mapeo por keyword;
+//     "completado"/"finalizado" no están confirmados contra HTML real.
+//
+// ⚠️ LÍMITE CONOCIDO: el capítulo de ejemplo (21 páginas) no muestra CDN con
+// protección por Referer -- las imágenes cargan directo desde images.mangalect.org.
+// Si otro manga/capítulo sí la tuviera, pageUrls() en Harbor solo puede devolver
+// string[] sin headers por imagen, así que no habría forma de arreglarlo desde aquí.
+//
+// ⚠️ La lista de capítulos viene en orden descendente (más nuevo primero) en el
+// HTML — se invierte en chapters() para devolverla ascendente.
 
 const BASE_URL = "https://mangalect.org";
 
 // --- Helpers de red y utilidades -------------------------------------------
 
-async function fetchText(urlOrPath) {
-  const full = urlOrPath.startsWith("http") ? urlOrPath : `${BASE_URL}${urlOrPath}`;
-  const res = await harbor.http(full, { 
-    responseType: "text",
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Referer": `${BASE_URL}/`
-    }
-  });
-  if (!res.ok) return null;
-  return res.body;
+async function fetchText(path) {
+  try {
+    const res = await harbor.http(`${BASE_URL}${path}`, {
+      responseType: "text",
+      headers: { Referer: `${BASE_URL}/` },
+    });
+    if (!res.ok) return null;
+    return res.body;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function fetchJson(url) {
+  try {
+    const res = await harbor.http(url, {
+      responseType: "json",
+      headers: { Referer: `${BASE_URL}/` },
+    });
+    if (!res.ok) return null;
+    return res.body;
+  } catch (e) {
+    return null;
+  }
 }
 
 function absoluteUrl(url) {
@@ -38,240 +81,315 @@ function decodeEntities(str) {
     .trim();
 }
 
-// Extractor unificado de tarjetas usando el DOM
-async function parseBookCards(html) {
+// slug a partir de "/info/SLUG/"
+function slugFromInfoHref(href) {
+  const parts = href.split("/").filter(Boolean); // ["info", slug]
+  return parts[1] || href;
+}
+
+// --- parseo de tarjetas de manga (reutilizable: home, tendencias) ----------
+// Confirmado: cada tarjeta es div.manga-card-v2 > a[href^="/info/"], con
+// img.lazy-load[data-src] (el src es un placeholder base64, se ignora) y
+// h3.overlay-text-title. El .format-badge (manga/manhwa/manhua) y el
+// .demographic-badge no se exponen en la interfaz Harbor, así que no se usan.
+function parseMangaCards(html) {
   if (!html) return [];
-  const doc = await harbor.parseHtml(html);
-  const links = doc.querySelectorAll('a[href*="/info/"]');
-  const seen = new Set();
   const results = [];
-
-  for (const a of links) {
-    const href = a.attr("href");
-    if (!href || seen.has(href)) continue;
-
-    // Extraer título
-    let title = "";
-    const hElement = a.querySelector("h3, h4, .title, .manga-title, .score-card-title");
-    if (hElement) {
-      title = decodeEntities(hElement.text());
-    } else {
-      const altImg = a.querySelector("img");
-      if (altImg && altImg.attr("alt")) {
-        title = decodeEntities(altImg.attr("alt").replace(/^Leer\s+/i, ""));
-      }
-    }
-
-    // Extraer portada
-    const img = a.querySelector("img");
-    let cover;
-    if (img) {
-      const dataSrc = img.attr("data-src");
-      const src = img.attr("src");
-      cover = (dataSrc && !dataSrc.startsWith("data:")) ? dataSrc : ((src && !src.startsWith("data:")) ? src : undefined);
-    }
-
-    if (href && title) {
-      seen.add(href);
-      results.push({
-        id: href,
-        title: title,
-        cover: absoluteUrl(cover)
-      });
-    }
+  const cardRe =
+    /<div class="manga-card-v2">\s*<a href="(\/info\/[^"]+\/)">[\s\S]*?<img[^>]*data-src="([^"]+)"[\s\S]*?<h3 class="overlay-text-title">([^<]+)<\/h3>/g;
+  let m;
+  while ((m = cardRe.exec(html)) !== null) {
+    results.push({
+      href: m[1],
+      cover: m[2],
+      title: decodeEntities(m[3]),
+    });
   }
-
   return results;
 }
 
-// --- Plugin Harbor --------------------------------------------------------
+// Bloque "Impulsados": a.featured-score-card
+function parseFeaturedCards(html) {
+  if (!html) return [];
+  const results = [];
+  const cardRe =
+    /<a href="(\/info\/[^"]+\/)" class="featured-score-card[^"]*">[\s\S]*?<img[^>]*data-src="([^"]+)"[\s\S]*?<h3 class="score-card-title">([^<]+)<\/h3>/g;
+  let m;
+  while ((m = cardRe.exec(html)) !== null) {
+    results.push({
+      href: m[1],
+      cover: m[2],
+      title: decodeEntities(m[3]),
+    });
+  }
+  return results;
+}
+
+// script#ssr-trends-data: JSON ya estructurado para la sección de Tendencias.
+// Confirmado en el HTML real de la home. Preferido sobre el parseo por regex
+// cuando está disponible, porque es más robusto a cambios de markup.
+function parseTrendsJson(html) {
+  if (!html) return [];
+  const m = html.match(
+    /<script id="ssr-trends-data" type="application\/json">([\s\S]*?)<\/script>/,
+  );
+  if (!m) return [];
+  try {
+    const data = JSON.parse(m[1]);
+    if (!Array.isArray(data)) return [];
+    return data.map((item) => ({
+      href: `/info/${item.slug}/`,
+      cover: `https://images.mangalect.org/file/leermangaesp/${item.portada}`,
+      title: decodeEntities(item.titulo),
+    }));
+  } catch (e) {
+    return [];
+  }
+}
+
+function dedupeCardsBySlug(cards) {
+  const seen = new Set();
+  const out = [];
+  for (const c of cards) {
+    const slug = slugFromInfoHref(c.href);
+    if (seen.has(slug)) continue;
+    seen.add(slug);
+    out.push(c);
+  }
+  return out;
+}
+
+// --- MangaProvider -----------------------------------------------------
 
 const plugin = {
   id: "mangalect",
   name: "MangaLect",
 
+  // Confirmado: la home no expone paginación real conocida (no vi ?page=N
+  // en biblioteca todavía). offset > 0 devuelve [] para no repetir contenido.
   async popular(offset, tagId) {
-    const page = Math.floor(offset / 24) + 1;
-    const path = `/biblioteca/?page=${page}`;
+    if (tagId) return plugin._byGenre(tagId, offset);
+    if (offset > 0) return [];
 
-    const html = await fetchText(path);
-    let cards = await parseBookCards(html);
+    const html = await fetchText("/");
+    if (!html) return [];
 
-    if (cards.length === 0 && page === 1) {
-      const homeHtml = await fetchText("/");
-      cards = await parseBookCards(homeHtml);
+    // Prioriza el JSON de tendencias (más fiable); si falla, cae a regex del DOM.
+    let cards = parseTrendsJson(html);
+    if (cards.length === 0) {
+      cards = dedupeCardsBySlug([
+        ...parseFeaturedCards(html),
+        ...parseMangaCards(html),
+      ]);
     }
 
-    return cards;
+    return cards.map((c) => ({
+      id: slugFromInfoHref(c.href),
+      title: c.title,
+      cover: absoluteUrl(c.cover),
+    }));
   },
 
+  // ASUMIDO: no tengo HTML real de /biblioteca/?generos=X para confirmar que
+  // esta ruta devuelve tarjetas con el mismo markup que la home. Lo sé porque
+  // el enlace de género en la ficha apunta a /biblioteca/?generos={nombre},
+  // pero no vi el resultado. Si no trae nada, revisar contra HTML real.
+  async _byGenre(tagId, offset) {
+    if (offset > 0) return [];
+    const html = await fetchText(`/biblioteca/?generos=${encodeURIComponent(tagId)}`);
+    if (!html) return [];
+
+    const cards = dedupeCardsBySlug([
+      ...parseFeaturedCards(html),
+      ...parseMangaCards(html),
+    ]);
+
+    return cards.map((c) => ({
+      id: slugFromInfoHref(c.href),
+      title: c.title,
+      cover: absoluteUrl(c.cover),
+    }));
+  },
+
+  // ASUMIDO: confirmé la URL del endpoint (data-search-url) pero no la forma
+  // de su JSON. Pruebo varios nombres de campo candidatos por robustez.
   async search(query, offset, tagId) {
-    if (!query) return plugin.popular(offset, tagId);
+    if (!query && tagId) return plugin._byGenre(tagId, offset);
+    if (!query) return [];
 
-    const page = Math.floor(offset / 24) + 1;
+    const json = await fetchJson(
+      `${BASE_URL}/api/api/busqueda-rapida/?q=${encodeURIComponent(query)}`,
+    );
+    if (!json) return [];
 
-    // 1. Probar parámetro q= en biblioteca
-    let html = await fetchText(`/biblioteca/?q=${encodeURIComponent(query)}&page=${page}`);
-    let results = await parseBookCards(html);
+    const rawList = Array.isArray(json)
+      ? json
+      : json.results || json.data || json.items || [];
 
-    // 2. Probar parámetro buscar= en biblioteca
-    if (results.length === 0) {
-      html = await fetchText(`/biblioteca/?buscar=${encodeURIComponent(query)}&page=${page}`);
-      results = await parseBookCards(html);
+    const results = [];
+    for (const item of rawList) {
+      const slugOrHref =
+        item.slug ||
+        item.href ||
+        item.link ||
+        item.url;
+      if (!slugOrHref) continue;
+
+      const id = slugOrHref.includes("/")
+        ? slugFromInfoHref(slugOrHref)
+        : slugOrHref;
+
+      const title = item.titulo || item.title || item.nombre || item.name;
+      if (!title) continue;
+
+      const cover =
+        item.portada || item.cover || item.image || item.img || item.thumbnail;
+
+      results.push({
+        id,
+        title: decodeEntities(title),
+        cover: cover
+          ? absoluteUrl(
+              cover.startsWith("http")
+                ? cover
+                : `https://images.mangalect.org/file/leermangaesp/${cover}`,
+            )
+          : undefined,
+      });
     }
 
-    // 3. Fallback: Endpoint API de búsqueda rápida
-    if (results.length === 0 && page === 1) {
-      try {
-        const apiRes = await harbor.http(`${BASE_URL}/api/api/busqueda-rapida/?q=${encodeURIComponent(query)}`, {
-          responseType: "json",
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": `${BASE_URL}/`
-          }
-        });
-
-        if (apiRes.ok && apiRes.body) {
-          const data = Array.isArray(apiRes.body) ? apiRes.body : (apiRes.body.results || apiRes.body.data || []);
-          for (const item of data) {
-            const href = item.url || item.link || (item.slug ? `/info/${item.slug}/` : null);
-            const title = item.title || item.nombre || item.name;
-            const cover = item.cover || item.portada || item.image || item.img;
-            if (href && title) {
-              results.push({
-                id: href,
-                title: decodeEntities(title),
-                cover: absoluteUrl(cover)
-              });
-            }
-          }
-        }
-      } catch (e) {
-        // Ignorar si la API no devuelve formato JSON válido
-      }
-    }
-
-    return results;
+    return results.slice(offset, offset + 24);
   },
 
   async detail(id) {
-    const html = await fetchText(id);
+    const html = await fetchText(`/info/${id}/`);
     if (!html) return null;
 
-    const doc = await harbor.parseHtml(html);
+    const titleMatch = html.match(/<h1 class="manga-title">([^<]+)<\/h1>/);
+    const title = titleMatch ? decodeEntities(titleMatch[1]) : id;
 
-    const titleNode = doc.querySelector("h1.manga-title, h1");
-    const title = titleNode ? decodeEntities(titleNode.text()) : "MangaLect";
+    const coverMatch = html.match(/<img src="([^"]+)" alt="[^"]*" class="manga-cover">/);
+    const cover = absoluteUrl(coverMatch?.[1]);
 
-    const imgNode = doc.querySelector("img.manga-cover, .manga-cover-wrapper img, meta[property='og:image']");
-    let cover;
-    if (imgNode) {
-      cover = imgNode.attr("src") || imgNode.attr("data-src") || imgNode.attr("content");
+    const altTitlesMatch = html.match(
+      /<ul class="info-value alternate-titles">([\s\S]*?)<\/ul>/,
+    );
+    let altTitle;
+    if (altTitlesMatch) {
+      const items = [...altTitlesMatch[1].matchAll(/<li>([^<]+)<\/li>/g)].map((m) =>
+        decodeEntities(m[1]),
+      );
+      altTitle = items.length ? items.join(", ") : undefined;
     }
 
-    const descNode = doc.querySelector("#synopsis-text, .synopsis p");
-    const description = descNode ? decodeEntities(descNode.text()) : undefined;
+    const descMatch = html.match(/<p id="synopsis-text">([\s\S]*?)<\/p>/);
+    const description = descMatch
+      ? decodeEntities(descMatch[1].replace(/\s+/g, " "))
+      : undefined;
 
-    const statusNode = doc.querySelector(".status-text, .circle-state-indicator + span");
-    const statusText = statusNode ? decodeEntities(statusNode.text()).toLowerCase() : "";
+    const statusMatch = html.match(/<span class="info-value status-text">\s*([^<]+?)\s*<\/span>/);
+    const statusRaw = statusMatch ? statusMatch[1].trim().toLowerCase() : "";
     let status;
-    if (statusText.includes("curso") || statusText.includes("publicando")) {
-      status = "ongoing";
-    } else if (statusText.includes("complet") || statusText.includes("finaliz")) {
-      status = "completed";
-    }
+    if (statusRaw.includes("curso")) status = "ongoing";
+    // ASUMIDO: no confirmado contra HTML real, keyword por analogía.
+    else if (statusRaw.includes("complet") || statusRaw.includes("finaliz")) status = "completed";
+
+    // El sitio no publica autor en la ficha (no hay campo "Autor" en el HTML visto).
+    const author = undefined;
 
     const chapterList = await plugin.chapters(id, html);
-    const lastChapter = chapterList.length ? chapterList[0].chapter : undefined;
+    const lastChapter = chapterList.length
+      ? chapterList[chapterList.length - 1].chapter
+      : undefined;
 
     return {
       id,
       title,
-      cover: absoluteUrl(cover),
+      altTitle,
+      cover,
       description,
       status,
-      lastChapter
+      lastChapter,
+      author,
     };
   },
 
+  // Confirmado: #chapter-list .chapter-card a.chapter-link[data-chapter][href],
+  // con .chapter-title y .chapter-date. Viene en orden descendente en el HTML
+  // (cap. más nuevo primero) -> se invierte para devolver ascendente.
   async chapters(id, cachedHtml) {
-    const html = cachedHtml || await fetchText(id);
+    const html = cachedHtml || (await fetchText(`/info/${id}/`));
     if (!html) return [];
 
-    const doc = await harbor.parseHtml(html);
-    const chapLinks = doc.querySelectorAll("a.chapter-link, .chapter-card a");
     const found = [];
-    const seen = new Set();
-
-    for (const a of chapLinks) {
-      const url = a.attr("href");
-      if (!url || url === "#" || seen.has(url)) continue;
-      seen.add(url);
-
-      const dataChapter = a.attr("data-chapter");
-      const titleNode = a.querySelector(".chapter-title");
-      const dateNode = a.querySelector(".chapter-date");
-
-      const titleText = titleNode ? decodeEntities(titleNode.text()) : decodeEntities(a.text());
-      const publishAt = dateNode ? decodeEntities(dateNode.text()) : undefined;
-
-      let chapterNum = dataChapter;
-      if (!chapterNum) {
-        const numMatch = titleText.match(/Cap[íi]tulo\s+([\d.]+)/i) || url.match(/\/([\d.]+)\/?$/);
-        chapterNum = numMatch ? numMatch[1] : null;
-      }
-
+    const cardRe =
+      /<a href="(\/lectura\/[^"]+\/)" class="chapter-link"\s+data-chapter="([^"]+)"[^>]*>[\s\S]*?<div class="chapter-title">([^<]*)<\/div>/g;
+    let m;
+    while ((m = cardRe.exec(html)) !== null) {
       found.push({
-        id: url,
-        chapter: chapterNum ? String(chapterNum) : null,
-        title: titleText,
+        id: m[1],
+        chapter: m[2],
+        title: decodeEntities(m[3]),
+        pages: 0, // el número de páginas no se expone en la ficha, solo en el capítulo
         language: "es",
-        publishAt: publishAt
       });
     }
 
-    return found;
+    return found.reverse();
   },
 
+  // Confirmado contra un capítulo real: Config.paginasRutas + Config.B2_URL
+  // en un <script> inline, sin cifrado. Coincide con el orden de
+  // #cascade-view img.manga-image (verificado: mismos 21 archivos, mismo orden).
   async pageUrls(chapterId) {
     const html = await fetchText(chapterId);
     if (!html) return [];
 
-    // Método 1: Extraer directamente de la configuración JS nativa de la página
     const b2Match = html.match(/B2_URL:\s*"([^"]+)"/);
-    const routesMatch = html.match(/paginasRutas:\s*(\[[^\]]+\])/);
+    const rutasMatch = html.match(/paginasRutas:\s*(\[[^\]]*\])/);
 
-    if (b2Match && routesMatch) {
+    if (b2Match && rutasMatch) {
       try {
-        const b2Url = b2Match[1];
-        const routes = JSON.parse(routesMatch[1]);
-        if (Array.isArray(routes) && routes.length > 0) {
-          return routes.map(r => `${b2Url}/${r}`);
+        const rutas = JSON.parse(rutasMatch[1]);
+        if (Array.isArray(rutas) && rutas.length > 0) {
+          return rutas.map((r) => `${b2Match[1]}/${r}`);
         }
       } catch (e) {
-        // En caso de fallo de sintaxis JSON, pasa al método por DOM
+        // cae al método por DOM si el JSON inline no parsea
       }
     }
 
-    // Método 2: Extracción a través del DOM usando los contenedores de vista en cascada
-    const doc = await harbor.parseHtml(html);
-    const imgs = doc.querySelectorAll("#cascade-view img, .cascade-page-container img, #page-by-page-view img");
-    if (imgs.length > 0) {
-      const urls = imgs
-        .map(img => img.attr("src") || img.attr("data-src"))
-        .filter(src => src && !src.startsWith("data:") && src.includes("pagina_"));
-      if (urls.length > 0) return [...new Set(urls.map(absoluteUrl))];
+    // Fallback: leer directo del DOM de #cascade-view
+    const urls = [
+      ...html.matchAll(
+        /<div class="manga-image-container cascade-page-container"[^>]*>[\s\S]*?<img src="([^"]+)"/g,
+      ),
+    ].map((m) => m[1]);
+
+    return urls.length ? [...new Set(urls.map(absoluteUrl))] : [];
+  },
+
+  // ASUMIDO/INCOMPLETO: sin HTML de /listas/ solo puedo devolver los géneros
+  // vistos en la home + ficha (#info-generos a.genero-item). El id es el
+  // nombre del género tal como aparece en el query param ?generos=, ya que
+  // no confirmé que exista un slug numérico o distinto.
+  async tags() {
+    const html = await fetchText("/");
+    if (!html) return [];
+
+    const tags = [];
+    const seen = new Set();
+    const genreRe = /<span class="genre-pill">([^<]+)<\/span>/g;
+    let m;
+    while ((m = genreRe.exec(html)) !== null) {
+      const name = decodeEntities(m[1]);
+      if (seen.has(name)) continue;
+      seen.add(name);
+      tags.push({ id: name, name });
     }
 
-    // Método 3: Expresión regular sobre la CDN de imágenes de MangaLect
-    const imgRe = /https:\/\/images\.mangalect\.org\/file\/[^\s"']+\.(?:webp|jpg|png|jpeg)/gi;
-    const matches = html.match(imgRe);
-    if (matches) {
-      return [...new Set(matches)];
-    }
-
-    return [];
-  }
+    return tags;
+  },
 };
 
 harbor.register(plugin);
