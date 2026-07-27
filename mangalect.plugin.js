@@ -278,11 +278,12 @@ const plugin = {
 
     const results = [];
     for (const item of rawList) {
-      const slugOrHref =
-        item.slug ||
-        item.href ||
-        item.link ||
-        item.url;
+      // FIX: los candidatos podían no ser string (p.ej. un id numérico), lo
+      // que rompía slugOrHref.includes("/"). Forzamos a string primero.
+      const rawSlugOrHref =
+        item.slug ?? item.href ?? item.link ?? item.url;
+      if (rawSlugOrHref === undefined || rawSlugOrHref === null) continue;
+      const slugOrHref = String(rawSlugOrHref);
       if (!slugOrHref) continue;
 
       const id = slugOrHref.includes("/")
@@ -298,7 +299,11 @@ const plugin = {
       results.push({
         id,
         title: decodeEntities(title),
-        cover: cover ? coverUrlFromPortada(cover.startsWith("http") ? undefined : cover) || absoluteUrl(cover) : undefined,
+        cover: cover
+          ? (String(cover).startsWith("http")
+              ? absoluteUrl(cover)
+              : coverUrlFromPortada(cover))
+          : undefined,
       });
     }
 
@@ -341,6 +346,11 @@ const plugin = {
     // El sitio no publica autor en la ficha (no hay campo "Autor" en el HTML visto).
     const author = undefined;
 
+    // NOTA: chapters() acepta un 2º parámetro opcional (cachedHtml) solo para
+    // reutilizar el HTML ya descargado aquí. Harbor nunca lo pasa: siempre
+    // llama chapters(id) a secas, así que el parámetro es puramente una
+    // optimización interna entre detail() y chapters(), no parte de la
+    // interfaz pública.
     const chapterList = await plugin.chapters(id, html);
     const lastChapter = chapterList.length
       ? chapterList[chapterList.length - 1].chapter
@@ -396,7 +406,10 @@ const plugin = {
       try {
         const rutas = JSON.parse(rutasMatch[1]);
         if (Array.isArray(rutas) && rutas.length > 0) {
-          return rutas.map((r) => `${b2Match[1]}/${r}`);
+          // FIX: filtramos por si alguna ruta resuelve a URL inválida.
+          return rutas
+            .map((r) => absoluteUrl(`${b2Match[1]}/${r}`))
+            .filter(Boolean);
         }
       } catch (e) {
         // cae al método por DOM si el JSON inline no parsea
@@ -410,7 +423,10 @@ const plugin = {
       ),
     ].map((m) => m[1]);
 
-    return urls.length ? [...new Set(urls.map(absoluteUrl))] : [];
+    // FIX: absoluteUrl() puede devolver undefined; filtramos antes del Set
+    // para no colar entradas inválidas en el array final.
+    const resolved = urls.map(absoluteUrl).filter(Boolean);
+    return [...new Set(resolved)];
   },
 
   // Confirmado contra HTML real de /biblioteca/: los géneros están en botones
