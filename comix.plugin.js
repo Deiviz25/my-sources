@@ -1,5 +1,5 @@
 // MangaLect — Harbor MangaProvider plugin
-// Creado a partir del HTML de la portada de mangalect.org
+// Corregido con el catálogo completo (/biblioteca/) y la búsqueda rápida por API
 
 const BASE_URL = "https://mangalect.org";
 
@@ -38,28 +38,47 @@ function decodeEntities(str) {
     .trim();
 }
 
-// --- Extracción de tarjetas de manga (Bento grid / listados) ---------------
-
-function parseCards(html) {
-  // Captura el enlace /info/..., la imagen data-src/src y el título <h3>
-  const cardRe = /<a\s+href="(\/info\/[^"]+)"[^>]*>[\s\S]*?<img[^>]+(?:data-src|src)="([^"]+)"[^>]*alt="([^"]*)"[\s\S]*?<h3>([^<]+)<\/h3>/g;
+// Extractor unificado de tarjetas usando el DOM
+async function parseBookCards(html) {
+  if (!html) return [];
+  const doc = await harbor.parseHtml(html);
+  const links = doc.querySelectorAll('a[href*="/info/"]');
   const seen = new Set();
   const results = [];
 
-  let m;
-  while ((m = cardRe.exec(html)) !== null) {
-    const href = m[1];
-    const cover = m[2];
-    const title = decodeEntities(m[4] || m[3]);
-
+  for (const a of links) {
+    const href = a.attr("href");
     if (!href || seen.has(href)) continue;
-    seen.add(href);
 
-    results.push({
-      id: href,
-      title: title,
-      cover: absoluteUrl(cover)
-    });
+    // Extraer título
+    let title = "";
+    const hElement = a.querySelector("h3, h4, .title, .manga-title, .score-card-title");
+    if (hElement) {
+      title = decodeEntities(hElement.text());
+    } else {
+      const altImg = a.querySelector("img");
+      if (altImg && altImg.attr("alt")) {
+        title = decodeEntities(altImg.attr("alt").replace(/^Leer\s+/i, ""));
+      }
+    }
+
+    // Extraer imagen (priorizando data-src sobre base64)
+    const img = a.querySelector("img");
+    let cover;
+    if (img) {
+      const dataSrc = img.attr("data-src");
+      const src = img.attr("src");
+      cover = (dataSrc && !dataSrc.startsWith("data:")) ? dataSrc : ((src && !src.startsWith("data:")) ? src : undefined);
+    }
+
+    if (href && title) {
+      seen.add(href);
+      results.push({
+        id: href,
+        title: title,
+        cover: absoluteUrl(cover)
+      });
+    }
   }
 
   return results;
@@ -72,26 +91,69 @@ const plugin = {
   name: "MangaLect",
 
   async popular(offset, tagId) {
-    // Si hay paginación offset > 0 se carga biblioteca
-    const page = Math.floor(offset / 20) + 1;
-    const path = page === 1 ? "/" : `/biblioteca/?page=${page}`;
-    
-    const html = await fetchText(path);
-    if (!html) return [];
+    // Paginación sobre la biblioteca completa en lugar de la home
+    const page = Math.floor(offset / 24) + 1;
+    const path = `/biblioteca/?page=${page}`;
 
-    return parseCards(html);
+    const html = await fetchText(path);
+    let cards = await parseBookCards(html);
+
+    // Fallback a portada si la biblioteca no devolvió datos en página 1
+    if (cards.length === 0 && page === 1) {
+      const homeHtml = await fetchText("/");
+      cards = await parseBookCards(homeHtml);
+    }
+
+    return cards;
   },
 
   async search(query, offset, tagId) {
     if (!query) return plugin.popular(offset, tagId);
 
-    const page = Math.floor(offset / 20) + 1;
-    const url = `/biblioteca/?q=${encodeURIComponent(query)}&page=${page}`;
-    
-    const html = await fetchText(url);
-    if (!html) return [];
+    const page = Math.floor(offset / 24) + 1;
 
-    return parseCards(html);
+    // 1. Probar búsqueda en /biblioteca/?q=
+    let html = await fetchText(`/biblioteca/?q=${encodeURIComponent(query)}&page=${page}`);
+    let results = await parseBookCards(html);
+
+    // 2. Probar parámetro alternativo /biblioteca/?buscar=
+    if (results.length === 0) {
+      html = await fetchText(`/biblioteca/?buscar=${encodeURIComponent(query)}&page=${page}`);
+      results = await parseBookCards(html);
+    }
+
+    // 3. Fallback: Consulta a la API de búsqueda rápida (/api/api/busqueda-rapida/)
+    if (results.length === 0 && page === 1) {
+      try {
+        const apiRes = await harbor.http(`${BASE_URL}/api/api/busqueda-rapida/?q=${encodeURIComponent(query)}`, {
+          responseType: "json",
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": `${BASE_URL}/`
+          }
+        });
+
+        if (apiRes.ok && apiRes.body) {
+          const data = Array.isArray(apiRes.body) ? apiRes.body : (apiRes.body.results || apiRes.body.data || []);
+          for (const item of data) {
+            const href = item.url || item.link || (item.slug ? `/info/${item.slug}/` : null);
+            const title = item.title || item.nombre || item.name;
+            const cover = item.cover || item.portada || item.image || item.img;
+            if (href && title) {
+              results.push({
+                id: href,
+                title: decodeEntities(title),
+                cover: absoluteUrl(cover)
+              });
+            }
+          }
+        }
+      } catch (e) {
+        // Silenciar errores de API si no responde JSON
+      }
+    }
+
+    return results;
   },
 
   async detail(id) {
@@ -101,16 +163,29 @@ const plugin = {
     const doc = await harbor.parseHtml(html);
 
     // Título
-    const titleNode = doc.querySelector("h1, .manga-title, .title");
+    const titleNode = doc.querySelector("h1.manga-title, h1");
     const title = titleNode ? decodeEntities(titleNode.text()) : "MangaLect";
 
     // Portada
-    const imgNode = doc.querySelector(".manga-cover img, .info-cover img, meta[property='og:image']");
-    const cover = imgNode ? (imgNode.attr("data-src") || imgNode.attr("src") || imgNode.attr("content")) : undefined;
+    const imgNode = doc.querySelector("img.manga-cover, .manga-cover-wrapper img, meta[property='og:image']");
+    let cover;
+    if (imgNode) {
+      cover = imgNode.attr("src") || imgNode.attr("data-src") || imgNode.attr("content");
+    }
 
     // Sinopsis
-    const descNode = doc.querySelector(".synopsis, .description, .manga-description, #sinopsis");
+    const descNode = doc.querySelector("#synopsis-text, .synopsis p");
     const description = descNode ? decodeEntities(descNode.text()) : undefined;
+
+    // Estado
+    const statusNode = doc.querySelector(".status-text, .circle-state-indicator + span");
+    const statusText = statusNode ? decodeEntities(statusNode.text()).toLowerCase() : "";
+    let status;
+    if (statusText.includes("curso") || statusText.includes("publicando")) {
+      status = "ongoing";
+    } else if (statusText.includes("complet") || statusText.includes("finaliz")) {
+      status = "completed";
+    }
 
     // Capítulos
     const chapterList = await plugin.chapters(id, html);
@@ -121,6 +196,7 @@ const plugin = {
       title,
       cover: absoluteUrl(cover),
       description,
+      status,
       lastChapter
     };
   },
@@ -129,27 +205,35 @@ const plugin = {
     const html = cachedHtml || await fetchText(id);
     if (!html) return [];
 
-    // Expresión regular para enlaces de lectura (/lectura/slug/capitulo/)
-    const chapRe = /<a\s+href="(\/lectura\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+    const doc = await harbor.parseHtml(html);
+    const chapLinks = doc.querySelectorAll("a.chapter-link, .chapter-card a");
     const found = [];
     const seen = new Set();
 
-    let m;
-    while ((m = chapRe.exec(html)) !== null) {
-      const url = m[1];
-      const text = decodeEntities(m[2].replace(/<[^>]+>/g, ""));
-
-      if (seen.has(url)) continue;
+    for (const a of chapLinks) {
+      const url = a.attr("href");
+      if (!url || url === "#" || seen.has(url)) continue;
       seen.add(url);
 
-      const numMatch = text.match(/Cap[íi]tulo\s+([\d.]+)/i) || url.match(/\/(\d+(\.\d+)?)\/?$/);
+      const dataChapter = a.attr("data-chapter");
+      const titleNode = a.querySelector(".chapter-title");
+      const dateNode = a.querySelector(".chapter-date");
+
+      const titleText = titleNode ? decodeEntities(titleNode.text()) : decodeEntities(a.text());
+      const publishAt = dateNode ? decodeEntities(dateNode.text()) : undefined;
+
+      let chapterNum = dataChapter;
+      if (!chapterNum) {
+        const numMatch = titleText.match(/Cap[íi]tulo\s+([\d.]+)/i) || url.match(/\/([\d.]+)\/?$/);
+        chapterNum = numMatch ? numMatch[1] : null;
+      }
 
       found.push({
         id: url,
-        chapter: numMatch ? numMatch[1] : null,
-        title: text,
+        chapter: chapterNum ? String(chapterNum) : null,
+        title: titleText,
         language: "es",
-        pages: 0
+        publishAt: publishAt
       });
     }
 
@@ -162,34 +246,41 @@ const plugin = {
 
     const doc = await harbor.parseHtml(html);
     
-    // Selectores habituales para el visor de imágenes
     const candidateSelectors = [
       ".reader-images img",
       ".reading-content img",
       "#chapter-images img",
       ".chapter-content img",
-      ".page-break img"
+      ".page-break img",
+      ".lectura-images img"
     ];
 
     for (const sel of candidateSelectors) {
       const imgs = doc.querySelectorAll(sel);
       if (imgs.length) {
-        return imgs
-          .map((img) => absoluteUrl(img.attr("data-src") || img.attr("src")))
+        const urls = imgs
+          .map((img) => {
+            const src = img.attr("data-src") || img.attr("src");
+            return (src && !src.startsWith("data:")) ? absoluteUrl(src) : null;
+          })
           .filter(Boolean);
+        if (urls.length) return urls;
       }
     }
 
-    // Heurística fallback por regex si las imágenes se inyectan en scripts o tags genéricos
-    const imgRe = /<img[^>]+(?:data-src|src)="([^"]+)"[^>]*class="[^"]*(?:page|chapter|reader)[^"]*"/gi;
+    // Fallback con Regex
+    const imgRe = /<img[^>]+(?:data-src|src)="([^"]+)"[^>]*>/gi;
     const pages = [];
     let m;
 
     while ((m = imgRe.exec(html)) !== null) {
-      pages.push(absoluteUrl(m[1]));
+      const src = m[1];
+      if (src && !src.startsWith("data:") && !src.includes("favicon") && !src.includes("logo") && !src.includes("brand")) {
+        pages.push(absoluteUrl(src));
+      }
     }
 
-    return pages;
+    return [...new Set(pages)];
   }
 };
 
