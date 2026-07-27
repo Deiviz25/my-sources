@@ -1,314 +1,265 @@
-/**
- * Harbor MangaProvider Plugin para Mangadotnet
- * Sitio: Mangadotnet (https://mangadot.net)
- * 
- * ============================================================================
- * SELECTORES Y ESTADO DE VERIFICACIÓN
- * ============================================================================
- * 
- * [CONFIRMADO] Tarjetas de Manga (Portada / Listados):
- *   - ID y URL: <a href="\/manga\/([^"]+)"
- *   - Imagen de portada: <img [^>]*src="([^"]+)"
- *   - Título: <div class="line-clamp-2[^>]*">(.*?)<\/div>
- * 
- * [CONFIRMADO] Ficha de Serie (/manga/{id}):
- *   - Título principal: <h1 class="...">(.*?)<\/h1>
- *   - Portada real (no el poster OG): dentro de contenedor aspect-[2/3] -> src="(\/uploads\/[^"]+)"
- *   - Descripción: contenedor <div class="text-sm text-white\/60..."> o <meta name="description" ...>
- *   - Estado (Ongoing / Completed): <span class="...">(Ongoing|Completed)<\/span>
- *   - Autor / Artista: href="\/search\?author=([^"]+)"
- *   - Total de capítulos / Último capítulo: "Chapters" -> <span class="...">(\d+)<\/span>
- *   - Ruta base de capítulos: URLs con formato /chapter/{chapterId}
- * 
- * [ASUMIDO] Lista completa de Capítulos (/manga/{id}):
- *   - El extracto HTML proporcionado de la ficha se cortó en la barra lateral antes de llegar al bloque de la lista de capítulos.
- *   - Se utiliza el regex general de enlaces /chapter/{id} (confirmado por el botón "Start Reading" que apunta a /chapter/284787).
- *   * Requiere confirmar la estructura exacta del listado completo de capítulos (ej. si están en un tab de Remix o renderizados directamente).
- * 
- * [ASUMIDO] Lector de Páginas (/chapter/{chapterId}):
- *   - Extracción de imágenes dentro del contenedor del visor o de la lista de páginas.
- *   * Requiere confirmación con el HTML real de una página de lectura.
- * 
- * [ASUMIDO] Búsqueda y Géneros:
- *   - Endpoints /search?q={query} o /search?search={genre} (detectados enlaces como /search?search=Comedy).
- * 
- * ============================================================================
- * LIMITACIONES CONOCIDAS
- * ============================================================================
- * ⚠️ [Corte de HTML]: El HTML de la ficha proporcionado finaliza en el sidebar, por lo que la lista completa de capítulos se deduce del patrón de enlace del botón "Start Reading" (/chapter/284787).
- * ⚠️ [Protección Anti-Hotlink CDN]: Las imágenes de portadas y páginas (/uploads/...) pueden requerir el header Referer: https://mangadot.net/.
- * ⚠️ [Paginación Portada]: La portada no expone una paginación standard por URL; si offset > 0, devuelve [] para evitar datos duplicados.
- */
-
-const SITE_URL = 'https://mangadot.net';
-const SITE_NAME = 'Mangadotnet';
-
-// ============================================================================
-// 1. HELPERS DE RED Y UTILIDADES
-// ============================================================================
-
-async function fetchText(url) {
+// mangadot.net — Harbor MangaProvider plugin
+//
+// Migrado desde un provider de Seanime (formato distinto: usa fetch directo,
+// class Provider, devuelve campos como `image`/`synonyms` en vez del shape
+// de Harbor). Esto NO es un port 1:1 — Harbor exige otra interfaz, otro
+// bridge de red (harbor.http, no fetch) y otro shape de retorno, así que
+// cada método se reescribió desde cero contra esa interfaz.
+//
+// ✅ Confirmado contra HTML real (portada, ficha de "Drawn to the Fire",
+// página de lectura del capítulo 15):
+//   - Portada: tarjetas <a class="group flex flex-col gap-1.5"
+//     href="/manga/ID">...<img src="PORTADA">...<div class="line-clamp-2
+//     ...">TÍTULO</div></a> en las secciones "Latest Updates", "Recently
+//     Added", "Most Tracked" y "Top Rated" — SÍ vienen en el HTML inicial
+//     (no solo en el JSON de hidratación de React), así que se pueden leer
+//     con regex sin ejecutar JS.
+//   - Ficha: título en <h1 class="text-2xl ... font-black text-white...">,
+//     portada en el <img loading="eager" fetchPriority="high">, sinopsis en
+//     el div de resumen, estado junto al punto de color (Ongoing/Completed),
+//     autor en la fila "Author" de la barra lateral.
+//   - Los géneros de una ficha enlazan a /search?search=<Género> — confirma
+//     que filtrar por género en este sitio ES una búsqueda por ese texto,
+//     no un slug de categoría aparte. tags()/_byGenre() usan justo eso.
+//
+// ⚠️ SIN CONFIRMAR — heredado del provider de Seanime original, no
+// verificado por mí contra una respuesta real:
+//   1. chapters() y pageUrls() NO tocan HTML: usan las mismas rutas de API
+//      que ya traía el provider de Seanime
+//      (/api/manga/{id}/chapters/list?lang=en y
+//      /api/chapters/{id}/images). La página de ficha SÍ confirma que existe
+//      una carga asíncrona ahí (el tab de capítulos muestra un spinner
+//      "Loading chapters..." en vez de venir en el HTML), así que una API así
+//      existe seguro — pero no vi la respuesta JSON real, solo heredé el
+//      parseo que ya traía el provider (campos chapter_number,
+//      chapter_title, scanlator_name/group_name, language, images[].url).
+//      Si chapters()/pageUrls() devuelven vacío, es la primera zona a
+//      revisar con una captura real de esas dos respuestas.
+//   2. /search?search=...&page=N: el patrón viene del provider original;
+//      no tengo el HTML de una página de resultados real para confirmar
+//      que reutiliza la misma tarjeta que la portada (la sección "You may
+//      also like" de la ficha usa una tarjeta distinta, más pequeña, así
+//      que no puedo asumir que todas las tarjetas del sitio son iguales).
+//      Si search()/tags() no devuelven nada, esto es lo primero a revisar.
+//   3. tags(): no había ninguna página de categorías/géneros en lo que me
+//      pasaste, así que esta lista es una selección manual armada con los
+//      géneros que sí aparecieron en las muestras (ficha + JSON de
+//      hidratación de la portada). Seguro que faltan géneros del catálogo
+//      real — mándame el HTML de la página de categorías si existe.
+//
+// ⚠️ Igual que con leercapitulo: el provider original mandaba `Referer` a
+// mano en cada fetch (típico de APIs con protección anti-hotlink). Harbor
+// elimina esa cabecera de toda llamada harbor.http sin excepción — si
+// /api/chapters/{id}/images la exige, las imágenes fallarán y no hay forma
+// de arreglarlo desde este archivo.
+ 
+const BASE_URL = "https://mangadot.net";
+const PAGE_SIZE = 48; // MANGA_PAGE: offset -> página
+ 
+// --- helpers de red --------------------------------------------------------
+ 
+async function fetchText(path) {
+  const res = await harbor.http(`${BASE_URL}${path}`, { responseType: "text" });
+  if (!res.ok) return null;
+  return res.body;
+}
+ 
+async function fetchJson(path) {
+  return harbor.http(`${BASE_URL}${path}`, { responseType: "json" });
+}
+ 
+function absoluteUrl(url) {
+  if (!url) return undefined;
   try {
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': SITE_URL
-      }
-    });
-    if (!res.ok) return null;
-    return await res.text();
-  } catch (err) {
-    return null;
+    return new URL(url, BASE_URL).toString();
+  } catch (e) {
+    return undefined;
   }
 }
-
-async function fetchJson(url) {
-  try {
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-        'Referer': SITE_URL
-      }
-    });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch (err) {
-    return null;
-  }
+ 
+function decodeEntities(str) {
+  if (!str) return str;
+  return str
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;/g, "'")
+    .replace(/&#0?39;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&nbsp;/g, " ")
+    .replace(/<!--\s*-->/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
-
-function absoluteUrl(path) {
-  if (!path) return '';
-  if (path.startsWith('http://') || path.startsWith('https://')) return path;
-  if (path.startsWith('//')) return 'https:' + path;
-  if (path.startsWith('/')) return SITE_URL + path;
-  return SITE_URL + '/' + path;
-}
-
-function decodeEntities(encodedString) {
-  if (!encodedString) return '';
-  const translate_re = /&(nbsp|amp|quot|lt|gt|#39|#x27);/g;
-  const translate = {
-    "nbsp": " ",
-    "amp": "&",
-    "quot": "\"",
-    "lt": "<",
-    "gt": ">",
-    "#39": "'",
-    "#x27": "'"
-  };
-  return encodedString.replace(translate_re, (match, entity) => translate[entity] || match);
-}
-
-// ============================================================================
-// 2. PARSEO DE TARJETAS DE MANGA
-// ============================================================================
-
+ 
+// --- tarjetas de manga (portada / búsqueda / género) ------------------------
+// Confirmado contra la portada real: <a class="group flex flex-col
+// gap-1.5" href="/manga/ID">...<img src="COVER">...<div
+// class="line-clamp-2 ...">TÍTULO</div></a>. El id que guardamos es solo el
+// número (p. ej. "23467"), porque las rutas de la API de capítulos/páginas
+// heredadas del provider de Seanime lo usan tal cual, sin el prefijo
+// "/manga/".
 function parseMangaCards(html) {
-  if (!html) return [];
+  const cardRe =
+    /<a class="group flex flex-col gap-1\.5" href="\/manga\/(\d+)"[^>]*>[\s\S]*?<img src="([^"]+)"[\s\S]*?<div class="line-clamp-2[^"]*">([\s\S]*?)<\/div><\/a>/g;
+ 
+  const seen = new Set();
   const results = [];
-  const seenIds = new Set();
-
-  const cardRegex = /<a[^>]+href="\/manga\/([^"]+)"[^>]*>[\s\S]*?<img[^>]+src="([^"]+)"[\s\S]*?<div class="line-clamp-2[^>]*">\s*([\s\S]*?)\s*<\/div>/g;
-
-  let match;
-  while ((match = cardRegex.exec(html)) !== null) {
-    const id = match[1].trim();
-    if (seenIds.has(id)) continue;
-
-    const cover = absoluteUrl(match[2].trim());
-    const title = decodeEntities(match[3].replace(/<!--.*?-->/g, '').trim());
-
-    if (id && title) {
-      seenIds.add(id);
-      results.push({ id, title, cover });
-    }
+ 
+  let m;
+  while ((m = cardRe.exec(html)) !== null) {
+    const id = m[1];
+    const cover = m[2];
+    const title = decodeEntities(m[3]);
+    if (!id || !title || seen.has(id)) continue;
+    seen.add(id);
+ 
+    results.push({ id, title, cover: absoluteUrl(cover) });
   }
-
+ 
   return results;
 }
-
-// ============================================================================
-// 3. DESOFUSCACIÓN / LÓGICA ESPECÍFICA
-// ============================================================================
-
-// No se detecta ofuscación en las páginas examinadas.
-
-// ============================================================================
-// 4. OBJETO PLUGIN (INTERFAZ HARBOR MANGAPROVIDER)
-// ============================================================================
-
+ 
+// --- MangaProvider -----------------------------------------------------
+ 
 const plugin = {
-  id: 'mangadotnet',
-  name: SITE_NAME,
-
-  async popular(offset = 0, tagId = null) {
-    if (tagId) {
-      return this.search('', offset, tagId);
-    }
-
+  id: "mangadot",
+  name: "MangaDot",
+ 
+  // La portada trae 4 secciones curadas (Latest Updates, Recently Added,
+  // Most Tracked, Top Rated) confirmadas contra HTML real; se combinan y
+  // deduplican por id. No hay paginación de portada, así que offset > 0
+  // pasa a usar /search con página calculada como fallback best-effort
+  // (ver aviso #2 al inicio del archivo).
+  async popular(offset, tagId) {
+    if (tagId) return plugin._byGenre(tagId, offset);
     if (offset > 0) return [];
-
-    const html = await fetchText(SITE_URL);
-    return parseMangaCards(html);
-  },
-
-  async search(query = '', offset = 0, tagId = null) {
-    if (offset > 0) return [];
-
-    let url = `${SITE_URL}/search`;
-    if (query) {
-      url += `?q=${encodeURIComponent(query)}`;
-    } else if (tagId) {
-      url += `?search=${encodeURIComponent(tagId)}`;
-    }
-
-    const html = await fetchText(url);
+ 
+    const html = await fetchText("/");
     if (!html) return [];
-
-    const results = parseMangaCards(html);
-
-    if (results.length > 0 && results.length <= 3) {
-      for (let i = 0; i < results.length; i++) {
-        const item = results[i];
-        const detailData = await this.detail(item.id);
-        if (detailData && detailData.altTitle) {
-          item.altTitle = detailData.altTitle;
-        }
-      }
-    }
-
-    return results;
+ 
+    return parseMangaCards(html).slice(0, PAGE_SIZE);
   },
-
+ 
+  // ⚠️ Sin confirmar (aviso #2): asumo que /search reutiliza la misma
+  // tarjeta que la portada.
+  async _byGenre(tagId, offset) {
+    const page = Math.floor(offset / PAGE_SIZE) + 1;
+    const html = await fetchText(`/search?search=${encodeURIComponent(tagId)}&page=${page}`);
+    if (!html) return [];
+    return parseMangaCards(html).slice(0, PAGE_SIZE);
+  },
+ 
+  async search(query, offset, tagId) {
+    if (!query && tagId) return plugin._byGenre(tagId, offset);
+ 
+    const page = Math.floor(offset / PAGE_SIZE) + 1;
+    const html = await fetchText(`/search?search=${encodeURIComponent(query)}&page=${page}`);
+    if (!html) return [];
+ 
+    return parseMangaCards(html).slice(0, PAGE_SIZE);
+  },
+ 
   async detail(id) {
-    const url = `${SITE_URL}/manga/${id}`;
-    const html = await fetchText(url);
+    const html = await fetchText(`/manga/${id}`);
     if (!html) return null;
-
-    // Título principal [CONFIRMADO]
-    const titleMatch = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
-    const title = titleMatch ? decodeEntities(titleMatch[1].replace(/<!--.*?-->/g, '').trim()) : undefined;
-
-    // Imagen de portada real [CONFIRMADO] (evita el og:image genérico de la vista OG)
-    const coverMatch = html.match(/aspect-\[2\/3\][\s\S]*?<img[^>]+src="([^"]+)"/i) ||
-                       html.match(/<img[^>]+src="(\/uploads\/[^"]+)"/i);
-    const cover = coverMatch ? absoluteUrl(coverMatch[1]) : undefined;
-
-    // Descripción [CONFIRMADO]
-    const descDivMatch = html.match(/<div class="text-sm text-white\/60[^>]*">[\s\S]*?<div>([\s\S]*?)<\/div>/i);
-    const metaDescMatch = html.match(/<meta\s+name="description"\s+content="([^"]+)"/i);
-    let description = descDivMatch ? descDivMatch[1] : (metaDescMatch ? metaDescMatch[1] : undefined);
-    if (description) {
-      description = decodeEntities(description.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '').trim());
-    }
-
-    // Estado [CONFIRMADO]
-    const statusMatch = html.match(/<span[^>]*>(Ongoing|Completed|Hiatus|Cancelled)<\/span>/i);
-    const status = statusMatch ? statusMatch[1].trim() : undefined;
-
-    // Autor [CONFIRMADO]
-    const authorMatch = html.match(/href="\/search\?author=[^"]*"[^>]*>([\s\S]*?)<\/a>/i);
-    const author = authorMatch ? decodeEntities(authorMatch[1].trim()) : undefined;
-
-    // Conteo / Último capítulo [CONFIRMADO]
-    const lastChapterMatch = html.match(/Chapters<\/span>\s*<span[^>]*>([\d.]+)<\/span>/i);
-    const lastChapter = lastChapterMatch ? parseFloat(lastChapterMatch[1]) : undefined;
-
+ 
+    const titleMatch = html.match(
+      /<h1 class="text-2xl md:text-\[30px\] font-black text-white[^"]*">([^<]+)<\/h1>/,
+    );
+    const coverMatch = html.match(
+      /<img src="([^"]+)"[^>]*loading="eager" fetchPriority="high"/,
+    );
+    const statusMatch = html.match(
+      /<span class="w-1\.5 h-1\.5 rounded-full bg-[a-z]+-500"><\/span>([^<]+)<\/span>/,
+    );
+    const descMatch = html.match(
+      /<div class="text-sm text-white\/60 leading-\[1\.7\][^"]*">\s*<div>([\s\S]*?)<\/div>\s*<\/div>/,
+    );
+    const authorMatch = html.match(
+      /Author<\/span><span[^>]*>(?:<span[^>]*>)?<a[^>]*>([^<]+)<\/a>/,
+    );
+ 
+    const description = descMatch
+      ? decodeEntities(descMatch[1].replace(/<br\s*\/?>/gi, "\n"))
+      : undefined;
+ 
+    const chapters = await plugin.chapters(id);
+    const lastChapter = chapters.length
+      ? chapters[chapters.length - 1].chapter
+      : undefined;
+ 
     return {
       id,
-      title: title || id,
-      altTitle: undefined,
-      cover,
+      title: titleMatch ? decodeEntities(titleMatch[1]) : id,
+      cover: absoluteUrl(coverMatch?.[1]),
       description,
-      status,
+      status: statusMatch ? decodeEntities(statusMatch[1]).toLowerCase() : undefined,
+      author: authorMatch ? decodeEntities(authorMatch[1]) : undefined,
       lastChapter,
-      author
     };
   },
-
+ 
+  // ⚠️ Sin confirmar contra una respuesta real (aviso #1). La ficha SÍ
+  // confirma que esta carga es asíncrona (spinner "Loading chapters..."),
+  // así que la API existe; el parseo de campos viene heredado del
+  // provider de Seanime.
   async chapters(id) {
-    const url = `${SITE_URL}/manga/${id}`;
-    const html = await fetchText(url);
-    if (!html) return [];
-
-    const chapters = [];
-    const seenIds = new Set();
-
-    // Captura enlaces a capítulos (/chapter/ID)
-    const chapterRegex = /<a[^>]+href="\/chapter\/([^"?#]+)[^"]*"[^>]*>([\s\S]*?)<\/a>/g;
-
-    let match;
-    while ((match = chapterRegex.exec(html)) !== null) {
-      const chapId = match[1].trim();
-      if (seenIds.has(chapId)) continue;
-      seenIds.add(chapId);
-
-      const rawText = decodeEntities(match[2].replace(/<[^>]+>/g, '').trim());
-      const numMatch = rawText.match(/Ch(?:apter)?\s*([\d.]+)/i) || chapId.match(/([\d.]+)/);
-      const chapterNum = numMatch ? parseFloat(numMatch[1]) : 0;
-
-      chapters.push({
-        id: chapId,
-        chapter: chapterNum,
-        title: rawText || `Chapter ${chapterNum}`,
-        pages: 0,
-        language: 'en'
-      });
-    }
-
-    return chapters.reverse();
+    const json = await fetchJson(`/api/manga/${id}/chapters/list?lang=en`);
+    const items = Array.isArray(json) ? json : [];
+ 
+    const chapters = items
+      .map((ch) => {
+        const chId = ch?.id != null ? String(ch.id) : null;
+        if (!chId) return null;
+ 
+        const number = ch?.chapter_number != null ? String(ch.chapter_number) : null;
+        const title = ch?.chapter_title ? decodeEntities(String(ch.chapter_title)) : undefined;
+        const group =
+          (ch?.scanlator_name && String(ch.scanlator_name).trim()) ||
+          (ch?.group_name && String(ch.group_name).trim()) ||
+          undefined;
+ 
+        return {
+          id: chId,
+          chapter: number,
+          title,
+          pages: 0,
+          language: ch?.language ? String(ch.language) : "en",
+          group,
+        };
+      })
+      .filter(Boolean);
+ 
+    chapters.sort((a, b) => parseFloat(a.chapter ?? "0") - parseFloat(b.chapter ?? "0"));
+    return chapters;
   },
-
+ 
+  // ⚠️ Sin confirmar (aviso #1 y aviso sobre Referer al inicio del archivo).
   async pageUrls(chapterId) {
-    const url = `${SITE_URL}/chapter/${chapterId}`;
-    const html = await fetchText(url);
-    if (!html) return [];
-
-    const pages = [];
-    
-    // Extracción de imágenes directas del lector
-    const imgRegex = /<img[^>]+src="([^"]+)"[^>]*class="[^"]*reader-page[^"]*"/g;
-    let match;
-    while ((match = imgRegex.exec(html)) !== null) {
-      pages.push(absoluteUrl(match[1]));
-    }
-
-    // Fallback: imágenes en rutas de uploads
-    if (pages.length === 0) {
-      const fallbackRegex = /<img[^>]+src="(\/uploads\/pages\/[^"]+|\/uploads\/chapters\/[^"]+|\/uploads\/manga\/[^"]+)"/g;
-      while ((match = fallbackRegex.exec(html)) !== null) {
-        pages.push(absoluteUrl(match[1]));
-      }
-    }
-
-    return pages;
+    const json = await fetchJson(`/api/chapters/${chapterId}/images`);
+    const images = Array.isArray(json?.images) ? json.images : [];
+ 
+    return images
+      .map((img) => absoluteUrl(img?.url))
+      .filter(Boolean);
   },
-
+ 
+  // ⚠️ Lista armada a mano con los géneros vistos en las muestras (aviso #3),
+  // no scrapeada de una página de categorías real. El id es literalmente el
+  // texto que el sitio espera en /search?search=<id> — confirmado porque
+  // los enlaces de género de la ficha usan ese mismo patrón.
   async tags() {
-    const html = await fetchText(SITE_URL);
-    if (!html) return [];
-
-    const tagsList = [];
-    const tagRegex = /<a[^>]+href="\/search\?search=([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-    
-    let match;
-    const seen = new Set();
-    while ((match = tagRegex.exec(html)) !== null) {
-      const tagId = match[1].trim();
-      const name = decodeEntities(match[2].replace(/<[^>]+>/g, '').trim());
-
-      if (tagId && name && !seen.has(tagId)) {
-        seen.add(tagId);
-        tagsList.push({ id: tagId, name });
-      }
-    }
-
-    return tagsList;
-  }
+    const GENRES = [
+      "Action", "Adventure", "Comedy", "Drama", "Fantasy", "Sci-Fi",
+      "Slice of Life", "Sports", "School Life", "Shounen", "Shoujo",
+      "Seinen", "Josei", "Isekai", "Mecha", "Horror", "Mystery",
+      "Psychological", "Romance", "Supernatural", "Tragedy", "Ecchi",
+      "Harem", "Mature", "Adult", "Boys Love", "Girls Love", "Historical",
+      "Martial Arts", "Military", "Crime", "Thriller",
+    ];
+ 
+    return GENRES.map((name) => ({ id: name, name }));
+  },
 };
-
-if (typeof harbor !== 'undefined') {
-  harbor.register(plugin);
+ 
+harbor.register(plugin);
 }
