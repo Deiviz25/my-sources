@@ -1,46 +1,94 @@
-// leercapitulo.co — Harbor MangaProvider plugin
+// mangalect.org — Harbor MangaProvider plugin
 //
-// Reescrito contra HTML real del sitio (portada, ficha de manga y capítulo),
-// ya no son heurísticas a ciegas. Selectores confirmados:
-//   - Portada: bloques ".hot-manga" (Tendencias) y ".mainpage-manga" (Últimos
-//     Capítulos Agregados), cada uno con <img data-src="..."> + título.
-//   - Ficha:  h1.title-manga, .cover-detail img, .description-update (alt
-//     títulos + géneros + estado), #example2.manga-collapse (sinopsis),
-//     .chapter-list ul li a.xanh (capítulos).
-//   - Capítulo: id="array_data" (imágenes en base64 con sustitución) +
-//     meta[property="ad:check"] (orden real de las páginas).
+// Selectores confirmados contra HTML real (home, ficha /info/, capítulo /lectura/):
+//   - Home:     div.manga-card-v2 > a[href^="/info/"] (+ img.lazy-load[data-src],
+//               h3.overlay-text-title, .format-badge), y script#ssr-trends-data (JSON)
+//   - Ficha:    h1.manga-title, img.manga-cover, ul.alternate-titles > li,
+//               #info-generos a.genero-item, #info-block .status-text,
+//               #synopsis-text, #chapter-list .chapter-card a.chapter-link[data-chapter]
+//   - Capítulo: <script> inline con Config.paginasRutas (array plano de rutas,
+//               SIN cifrado) + Config.B2_URL. Confirmado contra un capítulo real
+//               (he-perdido-la-cabeza-otra-vez / cap 1, 21 páginas).
+//   - Biblioteca: /api/buscar_mangas/?tipo=X&generos=Y&page=N&page_size=20
+//               Confirmado contra respuesta JSON real:
+//               { resultados: [{id, slug, titulo, portada, tipo, generos,
+//                 ultimo_capitulo, demografia}], page, page_size, total_pages,
+//                 total_results }
+//   - Géneros:  /biblioteca/ tiene el listado completo y estático en
+//               <button data-genero="Nombre">Nombre</button> dentro de
+//               .genre-selectors (65 géneros confirmados).
 //
-// ⚠️ LÍMITE CONOCIDO, NO ARREGLABLE DESDE EL PLUGIN: decodifiqué un
-// array_data real y las imágenes viven en un CDN con ruta ofuscada
-// (lc7-cdn.t34798ndc.com/...), el patrón típico de un host con protección
-// anti-hotlink por Referer. pageUrls() en Harbor solo puede devolver
-// string[] — no hay forma de adjuntar un header por imagen (a diferencia
-// del formato Mangayomi, que sí soporta {url, headers} por página). Si el
-// CDN exige Referer y lo rechaza, las imágenes fallarán pase lo que pase
-// en este archivo; sería necesario que Harbor exponga headers por página
-// en pageUrls(), no algo que yo pueda resolver aquí.
+// CONFIRMADO (con captura de red real, ya no es una suposición):
+//   - search(): /api/api/busqueda-rapida/?q=... devuelve la misma forma que
+//     /api/buscar_mangas/ (resultados/slug/titulo/portada, portada absoluta).
 //
-// ⚠️ Sin confirmar: la página de género (/genre/{slug}/) y su paginación.
-// Asumo que reutiliza el mismo bloque ".mainpage-manga" que la portada
-// porque es el patrón más común en este tipo de temas, pero no pude cargar
-// una página de género real para confirmarlo. Si tagId no trae resultados,
-// dímelo y lo reviso contra el HTML real de /genre/{slug}/.
- 
-const BASE_URL = "https://www.leercapitulo.co";
-const PAGE_SIZE = 48; // MANGA_PAGE: offset -> página
- 
-// --- helpers de red --------------------------------------------------------
- 
+// ASUMIDO (sin HTML/red real que lo confirme):
+//     parámetro en los botones del HTML pero no se capturó una petición de red
+//     real con ese filtro activo. Implementado pasando el parámetro "capitulos"
+//     tal cual, asumiendo que el backend lo acepta igual que tipo/generos.
+//   - "tipo" con valores distintos de "Manga": solo se confirmó tipo=Manga en la
+//     petición de red. Se asume que Manhwa/Manhua/Novela siguen el mismo patrón.
+//   - URL base de portadas para /api/buscar_mangas/: CONFIRMADO que "portada"
+//     puede venir ya como URL absoluta (https://images.mangalect.org/...). Se
+//     mantiene un fallback (prefijo ssr-trends-data) por si algún resultado
+//     trajera ruta relativa, sin confirmar ese caso específico.
+//   - status(): solo vi "En curso" en la ficha de ejemplo. Mapeo por keyword;
+//     "completado"/"finalizado" no están confirmados contra HTML real.
+//   - "tipo": CONFIRMADO contra red real con varios valores (manga, manhua,
+//     manhwa, novela), todos siguiendo el mismo patrón de resultado.
+//
+// ⚠️ LÍMITE CONOCIDO: el capítulo de ejemplo (21 páginas) no muestra CDN con
+// protección por Referer -- las imágenes cargan directo desde images.mangalect.org.
+// Si otro manga/capítulo sí la tuviera, pageUrls() en Harbor solo puede devolver
+// string[] sin headers por imagen, así que no habría forma de arreglarlo desde aquí.
+//
+// ⚠️ La lista de capítulos viene en orden descendente (más nuevo primero) en el
+// HTML — se invierte en chapters() para devolverla ascendente.
+//
+// ⚠️ Los géneros en /api/buscar_mangas/ vienen mezclados español/inglés y con
+// duplicados de facto (p.ej. "Fantasía"/"Fantasia", "Acción"/"Accion") en el
+// campo generos de cada manga individual. Esto es un dato del sitio, no un bug
+// del plugin — no se normaliza aquí para no inventar un mapeo no confirmado.
+
+const BASE_URL = "https://mangalect.org";
+const LIBRARY_PAGE_SIZE = 20; // Confirmado: page_size usado en la petición real capturada.
+
+// --- Helpers de red y utilidades -------------------------------------------
+
 async function fetchText(path) {
-  const res = await harbor.http(`${BASE_URL}${path}`, { responseType: "text" });
-  if (!res.ok) return null;
-  return res.body;
+  try {
+    const res = await harbor.http(`${BASE_URL}${path}`, {
+      responseType: "text",
+      headers: { Referer: `${BASE_URL}/` },
+    });
+    if (!res.ok) return null;
+    return res.body;
+  } catch (e) {
+    return null;
+  }
 }
- 
-async function fetchJson(path) {
-  return harbor.http(`${BASE_URL}${path}`, { responseType: "json" });
+
+async function fetchJson(url) {
+  try {
+    // OJO: con responseType "json", harbor.http devuelve el JSON YA
+    // parseado directamente (o null si no era JSON válido) — a diferencia
+    // de "text"/"base64", que sí devuelven {status, ok, headers, body}.
+    // Comprobar aquí .ok/.body como si fuera texto hacía que esta función
+    // devolviera null siempre, aunque la petición funcionara perfectamente.
+    const json = await harbor.http(url, {
+      responseType: "json",
+      headers: { Referer: `${BASE_URL}/` },
+    });
+    if (json === null) {
+      harbor.log("fetchJson: body no es JSON válido", url);
+    }
+    return json;
+  } catch (e) {
+    harbor.log("fetchJson: excepción", url, String(e));
+    return null;
+  }
 }
- 
+
 function absoluteUrl(url) {
   if (!url) return undefined;
   try {
@@ -49,7 +97,7 @@ function absoluteUrl(url) {
     return undefined;
   }
 }
- 
+
 function decodeEntities(str) {
   if (!str) return str;
   return str
@@ -57,330 +105,329 @@ function decodeEntities(str) {
     .replace(/&#0?39;/g, "'")
     .replace(/&amp;/g, "&")
     .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 }
- 
-// slug de la serie a partir de "/manga/SLUG/..." o "/leer/SLUG/.../N/"
-function slugFromMangaHref(href) {
-  const parts = href.split("/").filter(Boolean); // ["manga"|"leer", slug, ...]
+
+// slug a partir de "/info/SLUG/"
+function slugFromInfoHref(href) {
+  const parts = href.split("/").filter(Boolean); // ["info", slug]
   return parts[1] || href;
 }
- 
-// --- parseo de tarjetas de manga (portada / género) -------------------------
-// Reutilizado por popular() y por la búsqueda por género, porque ambas
-// secciones de la portada comparten la misma forma de tarjeta: un enlace a
-// /manga/, una <img data-src> para la portada y un título en un h3/h4 cerca.
- 
-function parseHotMangaBlocks(html) {
+
+// --- parseo de tarjetas de manga (reutilizable: home, tendencias) ----------
+// Confirmado: cada tarjeta es div.manga-card-v2 > a[href^="/info/"], con
+// img.lazy-load[data-src] (el src es un placeholder base64, se ignora) y
+// h3.overlay-text-title. El .format-badge (manga/manhwa/manhua) y el
+// .demographic-badge no se exponen en la interfaz Harbor, así que no se usan.
+function parseMangaCards(html) {
+  if (!html) return [];
   const results = [];
-  const re =
-    /<div class="hot-manga[^"]*"[\s\S]*?<a href="(\/manga\/[^"]+\/)"[^>]*>[\s\S]*?<img[^>]*data-src="([^"]+)"[\s\S]*?<h3 class="manga-title">([^<]+)<\/h3>/g;
+  const cardRe =
+    /<div class="manga-card-v2">\s*<a href="(\/info\/[^"]+\/)">[\s\S]*?<img[^>]*data-src="([^"]+)"[\s\S]*?<h3 class="overlay-text-title">([^<]+)<\/h3>/g;
   let m;
-  while ((m = re.exec(html)) !== null) {
-    results.push({ href: m[1], cover: m[2], title: decodeEntities(m[3]) });
+  while ((m = cardRe.exec(html)) !== null) {
+    results.push({
+      href: m[1],
+      cover: m[2],
+      title: decodeEntities(m[3]),
+    });
   }
   return results;
 }
- 
-function parseMainpageMangaBlocks(html) {
+
+// Bloque "Impulsados": a.featured-score-card
+function parseFeaturedCards(html) {
+  if (!html) return [];
   const results = [];
-  const re =
-    /<div class="media-left cover-manga">[\s\S]*?<a href="(\/manga\/[^"]+\/)"[^>]*>[\s\S]*?<img[^>]*data-src="([^"]+)"[\s\S]*?<h4 class="manga-newest">([^<]+)<\/h4>/g;
+  const cardRe =
+    /<a href="(\/info\/[^"]+\/)" class="featured-score-card[^"]*">[\s\S]*?<img[^>]*data-src="([^"]+)"[\s\S]*?<h3 class="score-card-title">([^<]+)<\/h3>/g;
   let m;
-  while ((m = re.exec(html)) !== null) {
-    results.push({ href: m[1], cover: m[2], title: decodeEntities(m[3]) });
+  while ((m = cardRe.exec(html)) !== null) {
+    results.push({
+      href: m[1],
+      cover: m[2],
+      title: decodeEntities(m[3]),
+    });
   }
   return results;
 }
- 
+
+// script#ssr-trends-data: JSON ya estructurado para la sección de Tendencias.
+// Confirmado en el HTML real de la home. Preferido sobre el parseo por regex
+// cuando está disponible, porque es más robusto a cambios de markup.
+function parseTrendsJson(html) {
+  if (!html) return [];
+  const m = html.match(
+    /<script id="ssr-trends-data" type="application\/json">([\s\S]*?)<\/script>/,
+  );
+  if (!m) return [];
+  try {
+    const data = JSON.parse(m[1]);
+    if (!Array.isArray(data)) return [];
+    return data.map((item) => ({
+      href: `/info/${item.slug}/`,
+      cover: `https://images.mangalect.org/file/leermangaesp/${item.portada}`,
+      title: decodeEntities(item.titulo),
+    }));
+  } catch (e) {
+    return [];
+  }
+}
+
 function dedupeCardsBySlug(cards) {
   const seen = new Set();
   const out = [];
   for (const c of cards) {
-    const slug = slugFromMangaHref(c.href);
+    const slug = slugFromInfoHref(c.href);
     if (seen.has(slug)) continue;
     seen.add(slug);
     out.push(c);
   }
   return out;
 }
- 
-// --- descifrado del array de páginas ---------------------------------------
-// El sitio esconde la lista de imágenes de un capítulo en un <script
-// id="array_data"> en base64 con las letras/dígitos sustituidos por este
-// mapa. Confirmado contra un capítulo real: decodifica a URLs absolutas de
-// imagen (ver aviso arriba sobre el CDN con protección anti-hotlink).
-const K2_TO_K1 = new Map([
-  ["0", "w"], ["1", "j"], ["2", "H"], ["3", "A"], ["4", "V"],
-  ["5", "Q"], ["6", "P"], ["7", "3"], ["8", "L"], ["9", "Y"],
-  ["A", "m"], ["B", "t"], ["C", "R"], ["D", "o"], ["E", "B"],
-  ["F", "x"], ["G", "T"], ["H", "C"], ["I", "N"], ["J", "0"],
-  ["K", "S"], ["L", "D"], ["M", "f"], ["N", "F"], ["O", "y"],
-  ["P", "h"], ["Q", "7"], ["R", "c"], ["S", "s"], ["T", "d"],
-  ["U", "9"], ["V", "e"], ["W", "J"], ["X", "z"], ["Y", "X"],
-  ["Z", "b"],
-  ["a", "a"], ["b", "I"], ["c", "q"], ["d", "G"], ["e", "n"],
-  ["f", "2"], ["g", "Z"], ["h", "M"], ["i", "5"], ["j", "6"],
-  ["k", "u"], ["l", "O"], ["m", "i"], ["n", "l"], ["o", "g"],
-  ["p", "r"], ["q", "K"], ["r", "v"], ["s", "p"], ["t", "8"],
-  ["u", "4"], ["v", "U"], ["w", "W"], ["x", "E"], ["y", "1"],
-  ["z", "k"],
-]);
- 
-function decodeArrayData(arrayData) {
-  const replaced = arrayData.replace(/[A-Za-z0-9]/g, (ch) => K2_TO_K1.get(ch) || ch);
- 
-  let decoded;
-  try {
-    decoded = atob(replaced);
-  } catch (e) {
-    return [];
-  }
- 
-  return decoded
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean);
+
+// --- Biblioteca (/api/buscar_mangas/) ---------------------------------------
+// Confirmado contra respuesta JSON real (petición de red capturada por el
+// usuario): { resultados: [...], page, page_size, total_pages, total_results }
+
+function coverUrlFromPortada(portada) {
+  if (!portada) return undefined;
+  // Confirmado contra respuesta real: /api/buscar_mangas/ puede devolver
+  // "portada" ya como URL absoluta (https://images.mangalect.org/...). Si no
+  // lo es, se asume la misma base que ssr-trends-data (no confirmada
+  // específicamente para este endpoint, pero consistente con el resto del sitio).
+  if (portada.startsWith("http")) return absoluteUrl(portada);
+  return absoluteUrl(`https://images.mangalect.org/file/leermangaesp/${portada}`);
 }
- 
+
+function mapResultadoToCard(item) {
+  return {
+    id: item.slug,
+    title: decodeEntities(item.titulo),
+    cover: coverUrlFromPortada(item.portada),
+  };
+}
+
+// tipo, generos y capitulos son opcionales. page es 1-indexed.
+async function fetchLibraryPage({ page, tipo, generos, capitulos }) {
+  const params = new URLSearchParams();
+  if (tipo) params.set("tipo", tipo);
+  if (generos) params.set("generos", generos);
+  if (capitulos) params.set("capitulos", capitulos); // ASUMIDO: no confirmado contra red real
+  params.set("page", String(page));
+  params.set("page_size", String(LIBRARY_PAGE_SIZE));
+
+  const json = await fetchJson(`${BASE_URL}/api/buscar_mangas/?${params.toString()}`);
+  if (!json || !Array.isArray(json.resultados)) return { cards: [], hasMore: false };
+
+  return {
+    cards: json.resultados.map(mapResultadoToCard),
+    hasMore: (json.page || page) < (json.total_pages || 1),
+  };
+}
+
 // --- MangaProvider -----------------------------------------------------
- 
+
 const plugin = {
-  id: "leercapitulo",
-  name: "LeerCapitulo",
- 
-  // La portada trae dos secciones ("Tendencias" y "Últimos Capítulos
-  // Agregados") que pueden repetir la misma serie; se combinan y deduplican
-  // por slug. No encontré paginación real de la portada, así que offset > 0
-  // devuelve vacío en vez de repetir la misma página.
+  id: "mangalect",
+  name: "MangaLect",
+
+  // offset 0: usa la home (tendencias/destacados), igual que antes.
+  // offset > 0 (o si la home falla): pagina de verdad contra /api/buscar_mangas/,
+  // confirmado con page = floor(offset / LIBRARY_PAGE_SIZE) + 1.
   async popular(offset, tagId) {
-    if (tagId) return this._byGenre(tagId, offset);
-    if (offset > 0) return [];
- 
-    const html = await fetchText("/");
-    if (!html) return [];
- 
-    const cards = dedupeCardsBySlug([
-      ...parseHotMangaBlocks(html),
-      ...parseMainpageMangaBlocks(html),
-    ]);
- 
-    return cards.slice(0, PAGE_SIZE).map((c) => ({
-      id: c.href,
-      title: c.title,
-      cover: absoluteUrl(c.cover),
-    }));
-  },
- 
-  // Best-effort: asumo que /genre/{slug}/ usa el mismo layout que la
-  // portada. Sin confirmar contra HTML real (ver aviso arriba).
-  async _byGenre(tagId, offset) {
-    const page = Math.floor(offset / PAGE_SIZE) + 1;
-    const path = page > 1 ? `/genre/${tagId}/${page}/` : `/genre/${tagId}/`;
-    const html = await fetchText(path);
-    if (!html) return [];
- 
-    const cards = dedupeCardsBySlug([
-      ...parseHotMangaBlocks(html),
-      ...parseMainpageMangaBlocks(html),
-    ]);
- 
-    return cards.slice(0, PAGE_SIZE).map((c) => ({
-      id: c.href,
-      title: c.title,
-      cover: absoluteUrl(c.cover),
-    }));
-  },
- 
-  async search(query, offset, tagId) {
-    if (!query && tagId) return this._byGenre(tagId, offset);
- 
-    const json = await fetchJson(`/search-autocomplete?term=${encodeURIComponent(query)}`);
-    if (!Array.isArray(json)) return [];
- 
-    const page = json.slice(offset, offset + PAGE_SIZE);
-    const results = [];
- 
-    if (json.length <= 6) {
-      // Pocos resultados: enriquecerlos abriendo cada ficha para sacar títulos alternativos.
-      const details = await Promise.all(
-        page.map(async (serie) => {
-          const html = await fetchText(serie.link);
-          const altTitle = html
-            ?.match(/<span>Títulos Alternativos: <\/span>(.*?)<br>/s)?.[1]
-            ?.split(",")
-            .map((t) => decodeEntities(t.trim()))
-            .join(", ");
- 
-          return {
-            id: serie.link,
-            title: serie.label,
-            altTitle,
-            cover: absoluteUrl(serie.thumbnail),
-          };
-        }),
-      );
-      results.push(...details);
-    } else {
-      for (const serie of page) {
-        results.push({
-          id: serie.link,
-          title: serie.label,
-          cover: absoluteUrl(serie.thumbnail),
-        });
+    if (tagId) return plugin._byGenre(tagId, offset);
+
+    if (offset === 0) {
+      const html = await fetchText("/");
+      if (html) {
+        let cards = parseTrendsJson(html);
+        if (cards.length === 0) {
+          cards = dedupeCardsBySlug([
+            ...parseFeaturedCards(html),
+            ...parseMangaCards(html),
+          ]);
+        }
+        if (cards.length > 0) {
+          return cards.map((c) => ({
+            id: slugFromInfoHref(c.href),
+            title: c.title,
+            cover: absoluteUrl(c.cover),
+          }));
+        }
       }
     }
- 
-    return results;
+
+    const page = Math.floor(offset / LIBRARY_PAGE_SIZE) + 1;
+    const { cards } = await fetchLibraryPage({ page });
+    return cards;
   },
- 
+
+  // Confirmado: /api/buscar_mangas/?generos=X&page=N&page_size=20
+  async _byGenre(tagId, offset) {
+    const page = Math.floor(offset / LIBRARY_PAGE_SIZE) + 1;
+    const { cards } = await fetchLibraryPage({ page, generos: tagId });
+    return cards;
+  },
+
+  // Confirmado contra respuesta real: misma forma que /api/buscar_mangas/
+  // (resultados/slug/titulo/portada, portada ya absoluta).
+  async search(query, offset, tagId) {
+    if (!query && tagId) return plugin._byGenre(tagId, offset);
+    if (!query) return [];
+
+    const url = `${BASE_URL}/api/api/busqueda-rapida/?q=${encodeURIComponent(query)}`;
+    harbor.log("search: pidiendo", url);
+    const json = await fetchJson(url);
+    harbor.log("search: respuesta", JSON.stringify(json));
+    if (!json || !Array.isArray(json.resultados)) return [];
+
+    return json.resultados.slice(offset, offset + 24).map(mapResultadoToCard);
+  },
+
   async detail(id) {
-    const html = await fetchText(id);
+    const html = await fetchText(`/info/${id}/`);
     if (!html) return null;
- 
-    const titleMatch = html.match(/<h1 class="title-manga">([^<]+)<\/h1>/);
-    const coverMatch = html.match(
-      /<div class="media-left cover-detail">\s*<img src="([^"]+)"/,
+
+    const titleMatch = html.match(/<h1 class="manga-title">([^<]+)<\/h1>/);
+    const title = titleMatch ? decodeEntities(titleMatch[1]) : id;
+
+    const coverMatch = html.match(/<img src="([^"]+)" alt="[^"]*" class="manga-cover">/);
+    const cover = absoluteUrl(coverMatch?.[1]);
+
+    const altTitlesMatch = html.match(
+      /<ul class="info-value alternate-titles">([\s\S]*?)<\/ul>/,
     );
- 
-    const descBlockMatch = html.match(
-      /<p class="description-update">([\s\S]*?)<\/p>/,
-    );
-    const descBlock = descBlockMatch ? descBlockMatch[1] : "";
- 
-    const altTitle = descBlock
-      .match(/<span>Títulos Alternativos: <\/span>(.*?)<br>/s)?.[1]
-      ?.split(",")
-      .map((t) => decodeEntities(t.trim()))
-      .join(", ");
- 
-    const genreBlockMatch = descBlock.match(
-      /<span>Géneros: <\/span>([\s\S]*?)<br>/,
-    );
-    const genre = genreBlockMatch
-      ? [...genreBlockMatch[1].matchAll(/<a[^>]*>([^<]+)<\/a>/g)].map((m) =>
-          decodeEntities(m[1]),
-        )
-      : [];
- 
-    const statusRaw = descBlock.match(/<span>Estado: <\/span>([^<]*)<br>/)?.[1]?.trim();
-    const status = statusRaw ? statusRaw.toLowerCase() : undefined;
- 
-    const synopsisMatch = html.match(
-      /<p id="example2" class="manga-collapse">([\s\S]*?)<\/p>/,
-    );
-    const description = synopsisMatch
-      ? decodeEntities(synopsisMatch[1].replace(/\s+/g, " ").trim())
+    let altTitle;
+    if (altTitlesMatch) {
+      const items = [...altTitlesMatch[1].matchAll(/<li>([^<]+)<\/li>/g)].map((m) =>
+        decodeEntities(m[1]),
+      );
+      altTitle = items.length ? items.join(", ") : undefined;
+    }
+
+    const descMatch = html.match(/<p id="synopsis-text">([\s\S]*?)<\/p>/);
+    const description = descMatch
+      ? decodeEntities(descMatch[1].replace(/\s+/g, " "))
       : undefined;
- 
-    const chapters = await plugin.chapters(id);
-    const lastChapter = chapters.length ? chapters[chapters.length - 1].chapter : undefined;
- 
+
+    const statusMatch = html.match(/<span class="info-value status-text">\s*([^<]+?)\s*<\/span>/);
+    const statusRaw = statusMatch ? statusMatch[1].trim().toLowerCase() : "";
+    let status;
+    if (statusRaw.includes("curso")) status = "ongoing";
+    // ASUMIDO: no confirmado contra HTML real, keyword por analogía.
+    else if (statusRaw.includes("complet") || statusRaw.includes("finaliz")) status = "completed";
+
+    // El sitio no publica autor en la ficha (no hay campo "Autor" en el HTML visto).
+    const author = undefined;
+
+    // NOTA: chapters() acepta un 2º parámetro opcional (cachedHtml) solo para
+    // reutilizar el HTML ya descargado aquí. Harbor nunca lo pasa: siempre
+    // llama chapters(id) a secas, así que el parámetro es puramente una
+    // optimización interna entre detail() y chapters(), no parte de la
+    // interfaz pública.
+    const chapterList = await plugin.chapters(id, html);
+    const lastChapter = chapterList.length
+      ? chapterList[chapterList.length - 1].chapter
+      : undefined;
+
     return {
       id,
-      title: titleMatch ? decodeEntities(titleMatch[1].trim()) : id,
+      title,
       altTitle,
-      cover: absoluteUrl(coverMatch?.[1]),
+      cover,
       description,
       status,
       lastChapter,
-      author: genre.length ? undefined : undefined, // el sitio no publica autor en la ficha
+      author,
     };
   },
- 
-  async chapters(id) {
-    const html = await fetchText(id);
+
+  // Confirmado: #chapter-list .chapter-card a.chapter-link[data-chapter][href],
+  // con .chapter-title y .chapter-date. Viene en orden descendente en el HTML
+  // (cap. más nuevo primero) -> se invierte para devolver ascendente.
+  async chapters(id, cachedHtml) {
+    const html = cachedHtml || (await fetchText(`/info/${id}/`));
     if (!html) return [];
- 
-    const listMatch = html.match(
-      /<div[^>]*class="chapter-list"[^>]*>[\s\S]*?<ul>([\s\S]*?)<\/ul>/i,
-    );
-    if (!listMatch) return [];
- 
-    const listHtml = listMatch[1].replace(/\s+/g, " ");
-    const liMatches = [...listHtml.matchAll(/<li[^>]*>(.*?)<\/li>/gs)].reverse();
- 
-    const chapters = [];
- 
-    liMatches.forEach((match) => {
-      const block = match[1];
-      const hrefMatch = block.match(/href="([^"]+)"/);
-      const titleMatch = block.match(/>([^<]+)<\/a>/);
-      if (!hrefMatch) return;
- 
-      const url = hrefMatch[1];
-      const title = titleMatch ? decodeEntities(titleMatch[1].trim()) : "";
-      const urlParts = url.split("/").filter(Boolean);
-      const number = urlParts[urlParts.length - 1];
- 
-      chapters.push({
-        id: url,
-        chapter: number ?? null,
-        title,
-        pages: 0,
+
+    const found = [];
+    const cardRe =
+      /<a href="(\/lectura\/[^"]+\/)" class="chapter-link"\s+data-chapter="([^"]+)"[^>]*>[\s\S]*?<div class="chapter-title">([^<]*)<\/div>/g;
+    let m;
+    while ((m = cardRe.exec(html)) !== null) {
+      found.push({
+        id: m[1],
+        chapter: m[2],
+        title: decodeEntities(m[3]),
+        pages: 0, // el número de páginas no se expone en la ficha, solo en el capítulo
         language: "es",
       });
-    });
- 
-    return chapters;
+    }
+
+    return found.reverse();
   },
- 
-  // ⚠️ Ver aviso al inicio del archivo: si el CDN de imágenes exige
-  // Referer, esto puede seguir fallando en Harbor pase lo que pase aquí,
-  // porque pageUrls() no admite headers por imagen en la spec actual.
+
+  // Confirmado contra un capítulo real: Config.paginasRutas + Config.B2_URL
+  // en un <script> inline, sin cifrado. Coincide con el orden de
+  // #cascade-view img.manga-image (verificado: mismos 21 archivos, mismo orden).
   async pageUrls(chapterId) {
     const html = await fetchText(chapterId);
     if (!html) return [];
- 
-    const arrayDataMatch = html.match(/id="array_data"[^>]*>([^<]+)</);
-    const arrayData = (arrayDataMatch ? arrayDataMatch[1] : "").trim();
-    const urlList = decodeArrayData(arrayData);
- 
-    const orderMetaMatch = html.match(/property="ad:check" content="([^"]+)"/);
-    const orderRaw = orderMetaMatch ? orderMetaMatch[1] : null;
- 
-    if (!orderRaw) return urlList;
- 
-    const orderList = orderRaw.replace(/[^\d]+/g, "-").split("-").filter(Boolean);
-    const useReversed = orderList.some((x) => x === "01");
- 
-    return orderList
-      .map((i) => {
-        const index = useReversed
-          ? parseInt(i.split("").reverse().join(""), 10)
-          : parseInt(i, 10);
-        return urlList[index];
-      })
-      .filter(Boolean)
-      .reverse();
-  },
- 
-  // Confirmado contra HTML real: sidebar de la portada y de la ficha.
-  async tags() {
-    const html = await fetchText("/");
-    if (!html) return [];
- 
-    const doc = await harbor.parseHtml(html);
-    const links = doc.querySelectorAll('a[href*="/genre/"]');
- 
-    const seen = new Set();
-    const tags = [];
- 
-    for (const a of links) {
-      const href = a.attr("href");
-      const name = a.text();
-      if (!href || !name || seen.has(href)) continue;
-      seen.add(href);
- 
-      const slug = href.split("/genre/")[1]?.replace(/\/$/, "");
-      if (!slug) continue;
- 
-      tags.push({ id: slug, name });
+
+    const b2Match = html.match(/B2_URL:\s*"([^"]+)"/);
+    const rutasMatch = html.match(/paginasRutas:\s*(\[[^\]]*\])/);
+
+    if (b2Match && rutasMatch) {
+      try {
+        const rutas = JSON.parse(rutasMatch[1]);
+        if (Array.isArray(rutas) && rutas.length > 0) {
+          // FIX: filtramos por si alguna ruta resuelve a URL inválida.
+          return rutas
+            .map((r) => absoluteUrl(`${b2Match[1]}/${r}`))
+            .filter(Boolean);
+        }
+      } catch (e) {
+        // cae al método por DOM si el JSON inline no parsea
+      }
     }
- 
-    return tags;
+
+    // Fallback: leer directo del DOM de #cascade-view
+    const urls = [
+      ...html.matchAll(
+        /<div class="manga-image-container cascade-page-container"[^>]*>[\s\S]*?<img src="([^"]+)"/g,
+      ),
+    ].map((m) => m[1]);
+
+    // FIX: absoluteUrl() puede devolver undefined; filtramos antes del Set
+    // para no colar entradas inválidas en el array final.
+    const resolved = urls.map(absoluteUrl).filter(Boolean);
+    return [...new Set(resolved)];
+  },
+
+  // Confirmado contra HTML real de /biblioteca/: los géneros están en botones
+  // estáticos <button data-genero="Nombre">Nombre</button> dentro de
+  // .genre-selectors. Lista completa (65 géneros vistos), a diferencia de la
+  // versión anterior que dependía de fichas ya visitadas y de un selector
+  // (.genre-pill) que no existe en el sitio real.
+  // El id es el valor exacto de data-genero, que es el mismo string que espera
+  // el parámetro ?generos= de /api/buscar_mangas/.
+  async tags() {
+    return [
+      "Acción", "Animación", "Apocalíptico", "Artes marciales", "Automóviles",
+      "Aventura", "Boys Love", "Ciberpunk", "Ciencia Ficción", "Comedia",
+      "Crimen", "Demonios", "Deporte", "Deportes", "Doujinshi", "Drama",
+      "Ecchi", "Espacio exterior", "Extranjero", "Familia", "Fantasía",
+      "Género Bender", "Girls Love", "Gore", "Guerra", "Harem", "Historia",
+      "Histórico", "Horror", "Isekai", "Josei", "Juegos", "Locura", "Magia",
+      "Mecha", "Militar", "Misterio", "Música", "Niños", "Oeste", "Parodia",
+      "Policía", "Policiaco", "Psicológico", "Realidad", "Realidad Virtual",
+      "Recuentos de la vida", "Reencarnación", "Romance", "Samurai", "Seinen",
+      "Shoujo", "Shoujo Ai", "Shounen", "Sobrenatural", "Superpoderes",
+      "Supervivencia", "Suspenso", "Telenovela", "Terror", "Thriller",
+      "Tragedia", "Traps", "Vampiros", "Vida escolar",
+    ].map((name) => ({ id: name, name }));
   },
 };
- 
+
 harbor.register(plugin);
- 
