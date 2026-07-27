@@ -37,28 +37,6 @@ function decodeEntities(str) {
     .trim();
 }
 
-// --- tarjetas de manga (portada / búsqueda / género) ------------------------
-function parseMangaCards(html) {
-  const cardRe =
-    /<a class="group flex flex-col gap-1\.5" href="\/manga\/(\d+)"[^>]*>[\s\S]*?<img src="([^"]+)"[\s\S]*?<div class="line-clamp-2[^"]*">([\s\S]*?)<\/div><\/a>/g;
-
-  const seen = new Set();
-  const results = [];
-
-  let m;
-  while ((m = cardRe.exec(html)) !== null) {
-    const id = m[1];
-    const cover = m[2];
-    const title = decodeEntities(m[3]);
-    if (!id || !title || seen.has(id)) continue;
-    seen.add(id);
-
-    results.push({ id, title, cover: absoluteUrl(cover) });
-  }
-
-  return results;
-}
-
 // --- MangaProvider -------------------------------------------------------
 
 const plugin = {
@@ -66,123 +44,155 @@ const plugin = {
   name: "MangaDot",
 
   async popular(offset, tagId) {
-    if (tagId) return plugin._byGenre(tagId, offset);
     if (offset > 0) return [];
-
-    const html = await fetchText("/");
-    if (!html) return [];
-
-    return parseMangaCards(html).slice(0, PAGE_SIZE);
+    return [];
   },
 
   async _byGenre(tagId, offset) {
-    const page = Math.floor(offset / PAGE_SIZE) + 1;
-    const html = await fetchText(`/search?search=${encodeURIComponent(tagId)}&page=${page}`);
-    if (!html) return [];
-    return parseMangaCards(html).slice(0, PAGE_SIZE);
+    if (offset > 0) return [];
+    return [];
   },
 
   async search(query, offset, tagId) {
     if (!query && tagId) return plugin._byGenre(tagId, offset);
 
-    const page = Math.floor(offset / PAGE_SIZE) + 1;
-    const html = await fetchText(`/search?search=${encodeURIComponent(query)}&page=${page}`);
-    if (!html) return [];
+    try {
+      const html = await fetchText(`/?s=${encodeURIComponent(query)}`);
+      if (!html) return [];
 
-    return parseMangaCards(html).slice(0, PAGE_SIZE);
+      const results = [];
+      const seen = new Set();
+
+      // Regex para extraer cards de manga
+      const cardRe = /<a[^>]*class="[^"]*block[^"]*"[^>]*href="([^"]+)"[^>]*>[\s\S]*?<img[^>]*src="([^"]+)"[\s\S]*?<h[34][^>]*class="[^"]*post-title[^"]*"[^>]*>([^<]+)<\/h[34]>/gi;
+
+      let m;
+      while ((m = cardRe.exec(html)) !== null) {
+        const href = m[1];
+        const img = m[2];
+        const title = decodeEntities(m[3]);
+
+        if (!href || !title || seen.has(href)) continue;
+        seen.add(href);
+
+        results.push({
+          id: href,
+          title,
+          cover: absoluteUrl(img),
+        });
+      }
+
+      return results.slice(offset, offset + PAGE_SIZE);
+    } catch (e) {
+      return [];
+    }
   },
 
   async detail(id) {
-    const html = await fetchText(`/manga/${id}`);
-    if (!html) return null;
+    try {
+      const html = await fetchText(id);
+      if (!html) return null;
 
-    const titleMatch = html.match(
-      /<h1 class="text-2xl md:text-\[30px\] font-black text-white[^"]*">([^<]+)<\/h1>/,
-    );
-    const coverMatch = html.match(
-      /<img src="([^"]+)"[^>]*loading="eager" fetchPriority="high"/,
-    );
-    const statusMatch = html.match(
-      /<span class="w-1\.5 h-1\.5 rounded-full bg-[a-z]+-500"><\/span>([^<]+)<\/span>/,
-    );
-    const descMatch = html.match(
-      /<div class="text-sm text-white\/60 leading-\[1\.7\][^"]*">\s*<div>([\s\S]*?)<\/div>\s*<\/div>/,
-    );
-    const authorMatch = html.match(
-      /Author<\/span><span[^>]*>(?:<span[^>]*>)?<a[^>]*>([^<]+)<\/a>/,
-    );
+      // Título
+      const titleMatch = html.match(/<h1[^>]*class="[^"]*entry-title[^"]*"[^>]*>([^<]+)<\/h1>/i);
+      const title = titleMatch ? decodeEntities(titleMatch[1]) : String(id);
 
-    const description = descMatch
-      ? decodeEntities(descMatch[1].replace(/<br\s*\/?>/gi, "\n"))
-      : undefined;
+      // Portada
+      const coverMatch = html.match(/<img[^>]*class="[^"]*post-image[^"]*"[^>]*src="([^"]+)"/i) ||
+                         html.match(/<img[^>]*src="([^"]+)"[^>]*class="[^"]*post-image[^"]*"/i);
+      const cover = coverMatch ? absoluteUrl(coverMatch[1]) : undefined;
 
-    const chapters = await plugin.chapters(id);
-    const lastChapter = chapters.length
-      ? chapters[chapters.length - 1].chapter
-      : undefined;
+      // Sinopsis/Descripción
+      const descMatch = html.match(/<div[^>]*class="[^"]*entry-content[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+      const description = descMatch ? decodeEntities(descMatch[1].replace(/<[^>]+>/g, " ").trim()) : undefined;
 
-    return {
-      id,
-      title: titleMatch ? decodeEntities(titleMatch[1]) : id,
-      cover: absoluteUrl(coverMatch?.[1]),
-      description,
-      status: statusMatch ? decodeEntities(statusMatch[1]).toLowerCase() : undefined,
-      author: authorMatch ? decodeEntities(authorMatch[1]) : undefined,
-      lastChapter,
-    };
+      // Capítulos
+      const chapters = await plugin.chapters(id);
+      const lastChapter = chapters.length ? chapters[chapters.length - 1].chapter : undefined;
+
+      return {
+        id,
+        title,
+        cover,
+        description,
+        author: undefined,
+        status: undefined,
+        lastChapter,
+      };
+    } catch (e) {
+      return null;
+    }
   },
 
   async chapters(id) {
-    const json = await fetchJson(`/api/manga/${id}/chapters/list?lang=en`);
-    const items = Array.isArray(json) ? json : [];
+    try {
+      const html = await fetchText(id);
+      if (!html) return [];
 
-    const chapters = items
-      .map((ch) => {
-        const chId = ch?.id != null ? String(ch.id) : null;
-        if (!chId) return null;
+      const chapters = [];
+      const seen = new Set();
 
-        const number = ch?.chapter_number != null ? String(ch.chapter_number) : null;
-        const title = ch?.chapter_title ? decodeEntities(String(ch.chapter_title)) : undefined;
-        const group =
-          (ch?.scanlator_name && String(ch.scanlator_name).trim()) ||
-          (ch?.group_name && String(ch.group_name).trim()) ||
-          undefined;
+      // Regex para extraer enlaces de capítulos
+      const chapterRe = /<a[^>]*href="([^"]+)"[^>]*>([^<]*Chapter[^<]*\d+[^<]*)<\/a>/gi;
 
-        return {
-          id: chId,
-          chapter: number,
-          title,
+      let m;
+      while ((m = chapterRe.exec(html)) !== null) {
+        const href = m[1];
+        const text = decodeEntities(m[2]);
+
+        if (!href || seen.has(href)) continue;
+        seen.add(href);
+
+        // Extraer número de capítulo del texto
+        const numMatch = text.match(/(\d+(?:\.\d+)?)/);
+        const chapterNum = numMatch ? numMatch[1] : "0";
+
+        chapters.push({
+          id: href,
+          chapter: chapterNum,
+          title: text,
           pages: 0,
-          language: ch?.language ? String(ch.language) : "en",
-          scanlator: group,
-        };
-      })
-      .filter(Boolean);
+          language: "en",
+        });
+      }
 
-    chapters.sort((a, b) => parseFloat(a.chapter ?? "0") - parseFloat(b.chapter ?? "0"));
-    return chapters;
+      return chapters.reverse();
+    } catch (e) {
+      return [];
+    }
   },
 
   async pageUrls(chapterId) {
-    const json = await fetchJson(`/api/chapters/${chapterId}/images`);
-    const images = Array.isArray(json?.images) ? json.images : [];
+    try {
+      const html = await fetchText(chapterId);
+      if (!html) return [];
 
-    return images
-      .map((img) => absoluteUrl(img?.url))
-      .filter(Boolean);
+      const urls = [];
+      const seen = new Set();
+
+      // Regex para extraer imágenes dentro de divs de contenido
+      const imgRe = /<img[^>]*src="([^"]+)"[^>]*class="[^"]*(?:post-image|wp-post-image)[^"]*"[^>]*>/gi;
+
+      let m;
+      while ((m = imgRe.exec(html)) !== null) {
+        const imgUrl = m[1];
+        if (!imgUrl || seen.has(imgUrl)) continue;
+        seen.add(imgUrl);
+
+        const absoluteImg = absoluteUrl(imgUrl);
+        if (absoluteImg) {
+          urls.push(absoluteImg);
+        }
+      }
+
+      return urls.filter(Boolean);
+    } catch (e) {
+      return [];
+    }
   },
 
   async tags() {
-    const GENRES = [
-      "Action", "Adventure", "Comedy", "Drama", "Fantasy", "Sci-Fi",
-      "Slice of Life", "Sports", "School Life", "Shounen", "Shoujo",
-      "Seinen", "Josei", "Isekai", "Mecha", "Horror", "Mystery",
-      "Psychological", "Romance", "Supernatural", "Tragedy", "Ecchi",
-      "Harem", "Mature", "Adult", "Boys Love", "Girls Love", "Historical",
-      "Martial Arts", "Military", "Crime", "Thriller",
-    ];
-
-    return GENRES.map((name) => ({ id: name, name }));
+    return [];
   },
 };
 
