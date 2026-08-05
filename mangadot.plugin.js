@@ -1,18 +1,70 @@
-const BASE_URL = "https://mangadot.net";
-const PAGE_SIZE = 48;
+// mangadot.net — Harbor MangaProvider plugin
+//
+// El sitio es una SPA en React (React Router SSR), NO WordPress. Rutas:
+//   Home:      /                    -> cards <a href="/manga/{id}">
+//   Ficha:     /manga/{id}
+//   Capítulo:  /chapter/{id}?source={source}   (todo el contenido se monta
+//              por JS del lado cliente; el HTML inicial solo trae un spinner)
+//
+// CONFIRMADO contra HTML real:
+//   - Home: cada card es <a class="group flex flex-col gap-1.5" href="/manga/{id}">
+//     con <img src="..."> y el título en <div class="line-clamp-2 ... text-[#fafafa]">Título</div>.
+//     El capítulo más reciente aparece como "Ch <!-- -->N" (comentario HTML en medio).
+//   - Ficha (/manga/{id}): <h1 class="text-2xl md:text-[30px] ...">Título</h1>,
+//     portada en <img ... class="h-full w-full object-cover transition-all duration-200"/>
+//     dentro del contenedor con ring-1 ring-white/10, meta og:description para la sinopsis,
+//     badge de estado (Ongoing/Completed/...) en un <span> con clases "rounded-full ... border",
+//     autor/artista como <a href="/search?author=Nombre">Nombre</a> /
+//     <a href="/search?artist=Nombre">Nombre</a>, géneros como
+//     <a href="/search?search=Genero">Genero</a>.
+//
+// CONFIRMADO contra respuestas JSON reales (capturas de red del usuario):
+//   - Lista de capítulos: un array plano de objetos
+//     { id, chapter_number, chapter_title, language, page_count, group_name,
+//       uploader_username, date_added, source, ... }
+//     Viene en orden ASCENDENTE (cap 1, 2, 3...) tal como se capturó.
+//   - Detalle de capítulo (páginas): objeto
+//     { chapter: {...}, manga: {...}, images: [{ url, w, h, filename }, ...],
+//       prev_chapter_id, next_chapter_id, prev_source, next_source, source }
+//     "images[].url" son rutas relativas tipo
+//     "/chapters/manga_{mangaId}/chapter_{n}_g{groupId}/001.webp".
+//
+// ASUMIDO (forma de los datos confirmada, pero la URL exacta de la petición NO
+// se capturó — solo se vio el body de la respuesta). Se construye siguiendo el
+// mismo patrón de rutas que el resto del sitio (/manga/{id}, /chapter/{id}?source=X).
+// Si el endpoint real difiere, solo hace falta ajustar CHAPTERS_ENDPOINT /
+// CHAPTER_DETAIL_ENDPOINT de abajo.
+function chaptersEndpoint(mangaId) {
+  return `/api/manga/${mangaId}/chapters`;
+}
+function chapterDetailEndpoint(chapterId, source) {
+  return `/api/chapter/${chapterId}?source=${encodeURIComponent(source || "user")}`;
+}
 
-// --- helpers de red --------------------------------------------------------
+const BASE_URL = "https://mangadot.net";
+
+// --- Helpers de red -------------------------------------------------------
 
 async function fetchText(path) {
-  const res = await harbor.http(`${BASE_URL}${path}`, { responseType: "text" });
-  if (!res.ok) return null;
-  return res.body;
+  try {
+    const res = await harbor.http(`${BASE_URL}${path}`, { responseType: "text" });
+    if (!res.ok) return null;
+    return res.body;
+  } catch (e) {
+    return null;
+  }
 }
 
 async function fetchJson(path) {
-  const res = await harbor.http(`${BASE_URL}${path}`, { responseType: "json" });
-  if (!res.ok) return null;
-  return res.body;
+  try {
+    // OJO (mismo detalle que en mangalect): con responseType "json",
+    // harbor.http devuelve el JSON ya parseado directamente, no un objeto
+    // {status, ok, body}. No comprobar .ok/.body aquí.
+    const json = await harbor.http(`${BASE_URL}${path}`, { responseType: "json" });
+    return json;
+  } catch (e) {
+    return null;
+  }
 }
 
 function absoluteUrl(url) {
@@ -32,231 +84,174 @@ function decodeEntities(str) {
     .replace(/&#0?39;/g, "'")
     .replace(/&amp;/g, "&")
     .replace(/&nbsp;/g, " ")
-    .replace(/<!--\s*-->/g, "")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-// --- helpers de parsing (independientes del orden de atributos) -----------
+// --- helpers de parsing de atributos/tags (independientes del orden) ------
 
-// Extrae el valor de un atributo dentro del texto de un tag, sin importar
-// dónde aparezca dentro del tag.
 function getAttr(tagStr, attrName) {
   const re = new RegExp(`${attrName}\\s*=\\s*["']([^"']*)["']`, "i");
   const m = tagStr.match(re);
   return m ? m[1] : undefined;
 }
 
-// Devuelve todos los tags <tagName ...> (auto-cerrados o no) como strings.
-function getTags(html, tagName) {
-  const re = new RegExp(`<${tagName}\\b[^>]*>`, "gi");
-  return html.match(re) || [];
-}
-
-// Extrae el contenido de un <div class="...target...">...</div> respetando
-// divs anidados (en vez de pararse en el primer </div> que encuentre).
-function extractBalancedDiv(html, classNeedle) {
-  const openRe = new RegExp(`<div\\b[^>]*class=["'][^"']*${classNeedle}[^"']*["'][^>]*>`, "i");
-  const openMatch = html.match(openRe);
-  if (!openMatch) return undefined;
-
-  const startIdx = openMatch.index + openMatch[0].length;
-  const tagRe = /<div\b[^>]*>|<\/div>/gi;
-  tagRe.lastIndex = startIdx;
-
-  let depth = 1;
-  let m;
-  while ((m = tagRe.exec(html)) !== null) {
-    if (m[0].toLowerCase() === "</div>") {
-      depth--;
-      if (depth === 0) {
-        return html.slice(startIdx, m.index);
-      }
-    } else {
-      depth++;
-    }
-  }
-  // Div sin cerrar correctamente: devolver lo que haya hasta el final.
-  return html.slice(startIdx);
-}
-
-function stripTags(html) {
-  return decodeEntities(html.replace(/<[^>]+>/g, " "));
-}
-
-// --- MangaProvider -------------------------------------------------------
+// --- MangaProvider -----------------------------------------------------
 
 const plugin = {
   id: "mangadot",
   name: "MangaDot",
 
+  // Confirmado: la home lista cards <a href="/manga/{id}"> con clase "group
+  // flex flex-col gap-1.5". No hay paginación real conocida en la home (no
+  // se capturó ninguna); offset > 0 devuelve vacío por ahora.
   async popular(offset, tagId) {
     if (offset > 0) return [];
-    return [];
+
+    const html = await fetchText("/");
+    if (!html) return [];
+
+    const results = [];
+    const seen = new Set();
+
+    // Cada card empieza con <a class="group flex flex-col gap-1.5" href="/manga/ID" ...>
+    const blocks = html.split(/(?=<a class="group flex flex-col gap-1\.5")/);
+
+    for (const block of blocks) {
+      const aTagMatch = block.match(/^<a\b[^>]*>/);
+      if (!aTagMatch) continue;
+      const aTag = aTagMatch[0];
+
+      const href = getAttr(aTag, "href");
+      if (!href || !/^\/manga\/\d+$/.test(href) || seen.has(href)) continue;
+
+      const closeIdx = block.search(/<\/a>/);
+      const inner = closeIdx >= 0 ? block.slice(0, closeIdx) : block;
+
+      const imgTag = (inner.match(/<img\b[^>]*>/) || [])[0];
+      const img = imgTag ? getAttr(imgTag, "src") : undefined;
+
+      const titleMatch = inner.match(
+        /<div class="line-clamp-2[^"]*text-\[#fafafa\][^"]*">([^<]+)<\/div>/,
+      );
+      const title = titleMatch ? decodeEntities(titleMatch[1]) : undefined;
+      if (!title) continue;
+
+      seen.add(href);
+      results.push({
+        id: href.replace(/^\/manga\//, ""),
+        title,
+        cover: absoluteUrl(img),
+      });
+    }
+
+    return results;
   },
 
   async _byGenre(tagId, offset) {
+    // No confirmado: no se capturó ninguna petición de filtrado por género.
     if (offset > 0) return [];
     return [];
   },
 
+  // No confirmado contra red real (no se capturó una búsqueda). Se deja
+  // deshabilitado en vez de adivinar un endpoint, para no dar resultados
+  // falsos silenciosamente.
   async search(query, offset, tagId) {
     if (!query && tagId) return plugin._byGenre(tagId, offset);
-
-    try {
-      const html = await fetchText(`/?s=${encodeURIComponent(query)}`);
-      if (!html) return [];
-
-      const results = [];
-      const seen = new Set();
-
-      // Cada card es un <a class="...block...">, buscamos todos los <a>
-      // y filtramos por clase (sin asumir orden de atributos).
-      const anchorBlocks = html.split(/(?=<a\b)/i);
-
-      for (const block of anchorBlocks) {
-        const aTagMatch = block.match(/^<a\b[^>]*>/i);
-        if (!aTagMatch) continue;
-        const aTag = aTagMatch[0];
-
-        const cls = getAttr(aTag, "class") || "";
-        if (!/\bblock\b/i.test(cls)) continue;
-
-        const href = getAttr(aTag, "href");
-        if (!href || seen.has(href)) continue;
-
-        // Sólo miramos hasta el cierre de este bloque (siguiente <a o fin)
-        const closeIdx = block.search(/<\/a>/i);
-        const inner = closeIdx >= 0 ? block.slice(0, closeIdx) : block;
-
-        const imgTag = (inner.match(/<img\b[^>]*>/i) || [])[0];
-        const img = imgTag ? getAttr(imgTag, "src") : undefined;
-
-        const titleMatch = inner.match(/<h[34]\b[^>]*class=["'][^"']*post-title[^"']*["'][^>]*>([^<]+)<\/h[34]>/i);
-        const title = titleMatch ? decodeEntities(titleMatch[1]) : undefined;
-
-        if (!title) continue;
-        seen.add(href);
-
-        results.push({
-          id: href,
-          title,
-          cover: absoluteUrl(img),
-        });
-      }
-
-      return results.slice(offset, offset + PAGE_SIZE);
-    } catch (e) {
-      return [];
-    }
+    return [];
   },
 
+  // Confirmado contra HTML real de /manga/{id}.
   async detail(id) {
-    try {
-      const html = await fetchText(id);
-      if (!html) return null;
+    const html = await fetchText(`/manga/${id}`);
+    if (!html) return null;
 
-      // Título
-      const titleMatch = html.match(/<h1\b[^>]*class=["'][^"']*entry-title[^"']*["'][^>]*>([^<]+)<\/h1>/i);
-      const title = titleMatch ? decodeEntities(titleMatch[1]) : String(id);
+    const titleMatch = html.match(
+      /<h1 class="text-2xl md:text-\[30px\][^"]*">([^<]+)<\/h1>/,
+    );
+    const title = titleMatch ? decodeEntities(titleMatch[1]) : String(id);
 
-      // Portada (busca todos los <img> y toma el que tenga la clase correcta,
-      // sin importar si "class" va antes o después de "src")
-      let cover;
-      for (const imgTag of getTags(html, "img")) {
-        const cls = getAttr(imgTag, "class") || "";
-        if (/\bpost-image\b/i.test(cls)) {
-          cover = absoluteUrl(getAttr(imgTag, "src"));
-          break;
-        }
-      }
-
-      // Sinopsis/Descripción (respeta divs anidados)
-      const descHtml = extractBalancedDiv(html, "entry-content");
-      const description = descHtml ? stripTags(descHtml) : undefined;
-
-      // Capítulos
-      const chapters = await plugin.chapters(id);
-      const lastChapter = chapters.length ? chapters[chapters.length - 1].chapter : undefined;
-
-      return {
-        id,
-        title,
-        cover,
-        description,
-        author: undefined,
-        status: undefined,
-        lastChapter,
-      };
-    } catch (e) {
-      return null;
+    // Portada: primer <img> dentro del contenedor con ring-1 ring-white/10.
+    let cover;
+    const coverBlockMatch = html.match(
+      /ring-1 ring-white\/10[^"]*"[^>]*>[\s\S]*?<img\b[^>]*>/,
+    );
+    if (coverBlockMatch) {
+      const imgTag = (coverBlockMatch[0].match(/<img\b[^>]*>/) || [])[0];
+      if (imgTag) cover = absoluteUrl(getAttr(imgTag, "src"));
     }
+
+    // Sinopsis: meta og:description es más fiable que el bloque del DOM
+    // (que trunca visualmente con "Read More").
+    const descMatch = html.match(
+      /<meta property="og:description" content="([^"]*)"\/>/,
+    );
+    const description = descMatch ? decodeEntities(descMatch[1]) : undefined;
+
+    // Estado: badge con texto plano dentro del span de estado.
+    const statusMatch = html.match(
+      /<span class="inline-flex items-center gap-1\.5 px-2\.5 py-0\.5 rounded-full text-xs font-bold border[^"]*">(?:<span[^>]*><\/span>)?([^<]+)<\/span>/,
+    );
+    const statusRaw = statusMatch ? statusMatch[1].trim().toLowerCase() : "";
+    let status;
+    if (statusRaw.includes("ongoing")) status = "ongoing";
+    else if (statusRaw.includes("completed")) status = "completed";
+    else if (statusRaw.includes("hiatus")) status = "hiatus";
+    else if (statusRaw.includes("cancel")) status = "cancelled";
+
+    const author = (html.match(/<a[^>]*href="\/search\?author=[^"]*"[^>]*>([^<]+)<\/a>/) || [])[1];
+    const artist = (html.match(/<a[^>]*href="\/search\?artist=[^"]*"[^>]*>([^<]+)<\/a>/) || [])[1];
+
+    const chapters = await plugin.chapters(id);
+    const lastChapter = chapters.length
+      ? chapters[chapters.length - 1].chapter
+      : undefined;
+
+    return {
+      id: String(id),
+      title,
+      cover,
+      description,
+      author: author ? decodeEntities(author) : undefined,
+      artist: artist ? decodeEntities(artist) : undefined,
+      status,
+      lastChapter,
+    };
   },
 
+  // CONFIRMADO (forma de datos) contra respuesta JSON real: array plano de
+  // capítulos ya en orden ascendente, con id/chapter_number/chapter_title/
+  // page_count/language/date_added/source. La URL del endpoint es ASUMIDA
+  // (ver chaptersEndpoint arriba) — la forma del array sí es 100% real.
   async chapters(id) {
-    try {
-      const html = await fetchText(id);
-      if (!html) return [];
+    const json = await fetchJson(chaptersEndpoint(id));
+    if (!Array.isArray(json)) return [];
 
-      const chapters = [];
-      const seen = new Set();
-
-      // Ya no exigimos la palabra "Chapter" en el texto: aceptamos cualquier
-      // enlace cuyo texto contenga un número (con o sin la palabra "Chapter"/"Ch."),
-      // que suele ser el patrón real en plantillas WP de manga.
-      const chapterRe = /<a\b[^>]*href="([^"]+)"[^>]*>\s*(?:Chapter|Ch\.?)?\s*(\d+(?:\.\d+)?)[^<]*<\/a>/gi;
-
-      let m;
-      while ((m = chapterRe.exec(html)) !== null) {
-        const href = m[1];
-        const chapterNum = m[2];
-
-        if (!href || seen.has(href)) continue;
-        seen.add(href);
-
-        chapters.push({
-          id: href,
-          chapter: chapterNum,
-          title: decodeEntities(m[0].replace(/<[^>]+>/g, "")),
-          pages: 0,
-          language: "en",
-        });
-      }
-
-      return chapters.reverse();
-    } catch (e) {
-      return [];
-    }
+    return json.map((ch) => ({
+      // El id de capítulo de Harbor debe llevar suficiente info para
+      // reconstruir la petición de páginas: guardamos "chapterId:source".
+      id: `${ch.id}:${ch.source || "user"}`,
+      chapter: String(ch.chapter_number),
+      title: ch.chapter_title ? decodeEntities(ch.chapter_title) : `Chapter ${ch.chapter_number}`,
+      pages: typeof ch.page_count === "number" ? ch.page_count : 0,
+      language: ch.language || "en",
+    }));
   },
 
+  // CONFIRMADO (forma de datos) contra dos respuestas JSON reales:
+  // { images: [{ url, w, h, filename }, ...], ... }. "url" es relativa al
+  // dominio. La URL del endpoint de detalle es ASUMIDA (ver
+  // chapterDetailEndpoint arriba).
   async pageUrls(chapterId) {
-    try {
-      const html = await fetchText(chapterId);
-      if (!html) return [];
+    const [rawId, source] = String(chapterId).split(":");
+    const json = await fetchJson(chapterDetailEndpoint(rawId, source));
+    if (!json || !Array.isArray(json.images)) return [];
 
-      const urls = [];
-      const seen = new Set();
-
-      // Recorremos todos los <img> y filtramos por clase, sin depender
-      // del orden en que aparezcan los atributos.
-      for (const imgTag of getTags(html, "img")) {
-        const cls = getAttr(imgTag, "class") || "";
-        if (!/\b(post-image|wp-post-image)\b/i.test(cls)) continue;
-
-        const src = getAttr(imgTag, "src");
-        if (!src || seen.has(src)) continue;
-        seen.add(src);
-
-        const absoluteImg = absoluteUrl(src);
-        if (absoluteImg) urls.push(absoluteImg);
-      }
-
-      return urls;
-    } catch (e) {
-      return [];
-    }
+    return json.images.map((img) => absoluteUrl(img.url)).filter(Boolean);
   },
 
+  // No confirmado contra red/HTML real (no se vio una página de géneros).
   async tags() {
     return [];
   },
