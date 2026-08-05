@@ -37,6 +37,53 @@ function decodeEntities(str) {
     .trim();
 }
 
+// --- helpers de parsing (independientes del orden de atributos) -----------
+
+// Extrae el valor de un atributo dentro del texto de un tag, sin importar
+// dónde aparezca dentro del tag.
+function getAttr(tagStr, attrName) {
+  const re = new RegExp(`${attrName}\\s*=\\s*["']([^"']*)["']`, "i");
+  const m = tagStr.match(re);
+  return m ? m[1] : undefined;
+}
+
+// Devuelve todos los tags <tagName ...> (auto-cerrados o no) como strings.
+function getTags(html, tagName) {
+  const re = new RegExp(`<${tagName}\\b[^>]*>`, "gi");
+  return html.match(re) || [];
+}
+
+// Extrae el contenido de un <div class="...target...">...</div> respetando
+// divs anidados (en vez de pararse en el primer </div> que encuentre).
+function extractBalancedDiv(html, classNeedle) {
+  const openRe = new RegExp(`<div\\b[^>]*class=["'][^"']*${classNeedle}[^"']*["'][^>]*>`, "i");
+  const openMatch = html.match(openRe);
+  if (!openMatch) return undefined;
+
+  const startIdx = openMatch.index + openMatch[0].length;
+  const tagRe = /<div\b[^>]*>|<\/div>/gi;
+  tagRe.lastIndex = startIdx;
+
+  let depth = 1;
+  let m;
+  while ((m = tagRe.exec(html)) !== null) {
+    if (m[0].toLowerCase() === "</div>") {
+      depth--;
+      if (depth === 0) {
+        return html.slice(startIdx, m.index);
+      }
+    } else {
+      depth++;
+    }
+  }
+  // Div sin cerrar correctamente: devolver lo que haya hasta el final.
+  return html.slice(startIdx);
+}
+
+function stripTags(html) {
+  return decodeEntities(html.replace(/<[^>]+>/g, " "));
+}
+
 // --- MangaProvider -------------------------------------------------------
 
 const plugin = {
@@ -63,16 +110,32 @@ const plugin = {
       const results = [];
       const seen = new Set();
 
-      // Regex para extraer cards de manga
-      const cardRe = /<a[^>]*class="[^"]*block[^"]*"[^>]*href="([^"]+)"[^>]*>[\s\S]*?<img[^>]*src="([^"]+)"[\s\S]*?<h[34][^>]*class="[^"]*post-title[^"]*"[^>]*>([^<]+)<\/h[34]>/gi;
+      // Cada card es un <a class="...block...">, buscamos todos los <a>
+      // y filtramos por clase (sin asumir orden de atributos).
+      const anchorBlocks = html.split(/(?=<a\b)/i);
 
-      let m;
-      while ((m = cardRe.exec(html)) !== null) {
-        const href = m[1];
-        const img = m[2];
-        const title = decodeEntities(m[3]);
+      for (const block of anchorBlocks) {
+        const aTagMatch = block.match(/^<a\b[^>]*>/i);
+        if (!aTagMatch) continue;
+        const aTag = aTagMatch[0];
 
-        if (!href || !title || seen.has(href)) continue;
+        const cls = getAttr(aTag, "class") || "";
+        if (!/\bblock\b/i.test(cls)) continue;
+
+        const href = getAttr(aTag, "href");
+        if (!href || seen.has(href)) continue;
+
+        // Sólo miramos hasta el cierre de este bloque (siguiente <a o fin)
+        const closeIdx = block.search(/<\/a>/i);
+        const inner = closeIdx >= 0 ? block.slice(0, closeIdx) : block;
+
+        const imgTag = (inner.match(/<img\b[^>]*>/i) || [])[0];
+        const img = imgTag ? getAttr(imgTag, "src") : undefined;
+
+        const titleMatch = inner.match(/<h[34]\b[^>]*class=["'][^"']*post-title[^"']*["'][^>]*>([^<]+)<\/h[34]>/i);
+        const title = titleMatch ? decodeEntities(titleMatch[1]) : undefined;
+
+        if (!title) continue;
         seen.add(href);
 
         results.push({
@@ -94,17 +157,23 @@ const plugin = {
       if (!html) return null;
 
       // Título
-      const titleMatch = html.match(/<h1[^>]*class="[^"]*entry-title[^"]*"[^>]*>([^<]+)<\/h1>/i);
+      const titleMatch = html.match(/<h1\b[^>]*class=["'][^"']*entry-title[^"']*["'][^>]*>([^<]+)<\/h1>/i);
       const title = titleMatch ? decodeEntities(titleMatch[1]) : String(id);
 
-      // Portada
-      const coverMatch = html.match(/<img[^>]*class="[^"]*post-image[^"]*"[^>]*src="([^"]+)"/i) ||
-                         html.match(/<img[^>]*src="([^"]+)"[^>]*class="[^"]*post-image[^"]*"/i);
-      const cover = coverMatch ? absoluteUrl(coverMatch[1]) : undefined;
+      // Portada (busca todos los <img> y toma el que tenga la clase correcta,
+      // sin importar si "class" va antes o después de "src")
+      let cover;
+      for (const imgTag of getTags(html, "img")) {
+        const cls = getAttr(imgTag, "class") || "";
+        if (/\bpost-image\b/i.test(cls)) {
+          cover = absoluteUrl(getAttr(imgTag, "src"));
+          break;
+        }
+      }
 
-      // Sinopsis/Descripción
-      const descMatch = html.match(/<div[^>]*class="[^"]*entry-content[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-      const description = descMatch ? decodeEntities(descMatch[1].replace(/<[^>]+>/g, " ").trim()) : undefined;
+      // Sinopsis/Descripción (respeta divs anidados)
+      const descHtml = extractBalancedDiv(html, "entry-content");
+      const description = descHtml ? stripTags(descHtml) : undefined;
 
       // Capítulos
       const chapters = await plugin.chapters(id);
@@ -132,25 +201,23 @@ const plugin = {
       const chapters = [];
       const seen = new Set();
 
-      // Regex para extraer enlaces de capítulos
-      const chapterRe = /<a[^>]*href="([^"]+)"[^>]*>([^<]*Chapter[^<]*\d+[^<]*)<\/a>/gi;
+      // Ya no exigimos la palabra "Chapter" en el texto: aceptamos cualquier
+      // enlace cuyo texto contenga un número (con o sin la palabra "Chapter"/"Ch."),
+      // que suele ser el patrón real en plantillas WP de manga.
+      const chapterRe = /<a\b[^>]*href="([^"]+)"[^>]*>\s*(?:Chapter|Ch\.?)?\s*(\d+(?:\.\d+)?)[^<]*<\/a>/gi;
 
       let m;
       while ((m = chapterRe.exec(html)) !== null) {
         const href = m[1];
-        const text = decodeEntities(m[2]);
+        const chapterNum = m[2];
 
         if (!href || seen.has(href)) continue;
         seen.add(href);
 
-        // Extraer número de capítulo del texto
-        const numMatch = text.match(/(\d+(?:\.\d+)?)/);
-        const chapterNum = numMatch ? numMatch[1] : "0";
-
         chapters.push({
           id: href,
           chapter: chapterNum,
-          title: text,
+          title: decodeEntities(m[0].replace(/<[^>]+>/g, "")),
           pages: 0,
           language: "en",
         });
@@ -170,22 +237,21 @@ const plugin = {
       const urls = [];
       const seen = new Set();
 
-      // Regex para extraer imágenes dentro de divs de contenido
-      const imgRe = /<img[^>]*src="([^"]+)"[^>]*class="[^"]*(?:post-image|wp-post-image)[^"]*"[^>]*>/gi;
+      // Recorremos todos los <img> y filtramos por clase, sin depender
+      // del orden en que aparezcan los atributos.
+      for (const imgTag of getTags(html, "img")) {
+        const cls = getAttr(imgTag, "class") || "";
+        if (!/\b(post-image|wp-post-image)\b/i.test(cls)) continue;
 
-      let m;
-      while ((m = imgRe.exec(html)) !== null) {
-        const imgUrl = m[1];
-        if (!imgUrl || seen.has(imgUrl)) continue;
-        seen.add(imgUrl);
+        const src = getAttr(imgTag, "src");
+        if (!src || seen.has(src)) continue;
+        seen.add(src);
 
-        const absoluteImg = absoluteUrl(imgUrl);
-        if (absoluteImg) {
-          urls.push(absoluteImg);
-        }
+        const absoluteImg = absoluteUrl(src);
+        if (absoluteImg) urls.push(absoluteImg);
       }
 
-      return urls.filter(Boolean);
+      return urls;
     } catch (e) {
       return [];
     }
