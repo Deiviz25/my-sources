@@ -259,17 +259,51 @@ const plugin = {
   // paginación en la extensión original: hace una sola petición y ya está).
   async chapters(id) {
     const json = await fetchJson(`${API_URL}/manga/${encodeURIComponent(id)}/chapters/list`);
-    if (!Array.isArray(json)) return [];
+    if (!json) {
+      harbor.log("mangadot: chapters() recibió null o error en", id);
+      return [];
+    }
 
-    const chapters = json
+    // Manejar múltiples formatos de respuesta posibles
+    let chaptersData = [];
+    if (Array.isArray(json)) {
+      chaptersData = json;
+    } else if (json.data && Array.isArray(json.data)) {
+      chaptersData = json.data;
+    } else if (json.chapters && Array.isArray(json.chapters)) {
+      chaptersData = json.chapters;
+    } else {
+      harbor.log("mangadot: chapters() recibió formato inesperado:", typeof json, Object.keys(json || {}));
+      return [];
+    }
+
+    const chapters = chaptersData
       .map((c) => {
         if (c == null || c.id == null) return null;
-        const chapNum = c.chapter_number != null ? String(c.chapter_number) : "0";
-        const hasGroup = c.group_name && String(c.group_name).length;
-        const title =
-          c.chapter_title && String(c.chapter_title).length
-            ? fixMojibake(c.chapter_title)
-            : `${c.volume_number ? "Volume " + c.volume_number + " " : ""}Chapter ${chapNum}`;
+
+        // Parsear número de capítulo de varias formas posibles
+        let chapNum = "0";
+        if (c.chapter_number != null) {
+          chapNum = String(c.chapter_number);
+        } else if (c.number != null) {
+          chapNum = String(c.number);
+        } else if (c.chapterNumber != null) {
+          chapNum = String(c.chapterNumber);
+        }
+
+        // Detectar si es carga del usuario (tiene grupo de scanlación)
+        const hasGroup = c.group_name || c.scanlator_group || c.translator_group || c.group;
+
+        // Construir título
+        let title = `Chapter ${chapNum}`;
+        if (c.chapter_title && String(c.chapter_title).length) {
+          title = fixMojibake(c.chapter_title);
+        } else if (c.title && String(c.title).length) {
+          title = fixMojibake(c.title);
+        } else if (c.volume_number || c.volume) {
+          const vol = c.volume_number || c.volume;
+          title = `Volume ${vol} Chapter ${chapNum}`;
+        }
 
         return {
           // El sufijo "?source=user" indica que las páginas viven bajo /api/uploads/
@@ -278,15 +312,16 @@ const plugin = {
           id: hasGroup ? `${c.id}?source=user` : String(c.id),
           chapter: chapNum,
           title,
-          pages: 0,
-          language: "en",
-          publishAt: c.date_added || undefined,
-          scanlator: hasGroup ? String(c.group_name) : "Official",
+          pages: c.page_count || c.pages || 0,
+          language: c.language || "en",
+          publishAt: c.date_added || c.upload_date || c.created_at || c.date || undefined,
+          group: hasGroup ? String(hasGroup) : undefined,
         };
       })
       .filter(Boolean);
 
     chapters.sort((a, b) => parseFloat(a.chapter) - parseFloat(b.chapter));
+    harbor.log(`mangadot: chapters() retornando ${chapters.length} capítulos para manga ${id}`);
     return chapters;
   },
 
@@ -297,10 +332,60 @@ const plugin = {
       ? `${API_URL}/uploads/${encodeURIComponent(rawId)}/images`
       : `${API_URL}/chapters/${encodeURIComponent(rawId)}/images`;
 
+    harbor.log(`mangadot: pageUrls() pidiendo ${endpoint}`);
     const json = await fetchJson(endpoint);
-    if (!json || !Array.isArray(json.images)) return [];
 
-    return json.images.map((img) => absoluteUrl(img.url)).filter(Boolean);
+    if (!json) {
+      harbor.log("mangadot: pageUrls() recibió null en", endpoint);
+      return [];
+    }
+
+    let images = [];
+
+    // Intentar múltiples formatos de respuesta
+    if (Array.isArray(json)) {
+      // Formato: array directo de strings o objetos
+      images = json;
+    } else if (json.images && Array.isArray(json.images)) {
+      // Formato: {images: [...]}
+      images = json.images;
+    } else if (json.data && Array.isArray(json.data)) {
+      // Formato: {data: [...]} o {data: {images: [...]}}
+      if (json.data.length > 0 && typeof json.data[0] === "object" && json.data[0].images) {
+        images = json.data[0].images;
+      } else {
+        images = json.data;
+      }
+    } else if (json.pages && Array.isArray(json.pages)) {
+      // Formato: {pages: [...]}
+      images = json.pages;
+    } else if (json.content && Array.isArray(json.content)) {
+      // Formato: {content: [...]}
+      images = json.content;
+    } else {
+      harbor.log("mangadot: pageUrls() recibió formato inesperado:", typeof json, Object.keys(json || {}));
+      return [];
+    }
+
+    const result = images
+      .map((img) => {
+        // Soportar múltiples formatos de item:
+        // - string directo: "url"
+        // - objeto con url: {url: "...", ...}
+        // - objeto con image: {image: "...", ...}
+        // - objeto con src: {src: "...", ...}
+        let url = null;
+        if (typeof img === "string") {
+          url = img;
+        } else if (typeof img === "object" && img !== null) {
+          url = img.url || img.image || img.src || img.link;
+        }
+        return absoluteUrl(url);
+      })
+      .filter(Boolean);
+
+    harbor.log(`mangadot: pageUrls() retornando ${result.length} imágenes para capítulo ${chapterId}`);
+    return result;
   },
 
   // Lista de géneros confirmada del getFilterList() original (GenreFilter).
