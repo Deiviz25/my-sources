@@ -1,35 +1,3 @@
-// mangadot.net — Harbor MangaProvider plugin
-//
-// Portado directamente del código fuente real de la extensión Mangayomi/Tachiyomi
-// para mangadot.net (que el usuario proporcionó descompilada del .apk). Todos los
-// endpoints, parámetros y la lógica de "hydrate" vienen confirmados de ese código,
-// no son heurísticas inventadas.
-//
-// El sitio es una app React Router v7 (SSR). Las páginas normales devuelven HTML,
-// pero añadiendo ".data" a la ruta (y el query param _routes) el servidor devuelve
-// el payload de hidratación en un formato compacto: un array plano donde muchos
-// valores son índices que apuntan a otras posiciones del mismo array (para
-// deduplicar objetos repetidos). hydrate() reconstruye el árbol real a partir de
-// ese formato — es el mismo mecanismo que produce los <script>...streamController
-// .enqueue(...)</script> que se ven en el HTML normal, solo que en .data viene ya
-// aislado y sin el resto de la página.
-//
-// Endpoints confirmados:
-//   - Populares:   GET {baseUrl}/view-all/most-tracked.data?adult=1&page=N&_routes=pages/ViewAllPage
-//   - Recientes:   GET {baseUrl}/view-all/latest-updates.data?adult=1&page=N&_routes=pages/ViewAllPage
-//   - Búsqueda:    GET {baseUrl}/search.data?search=...&adult=1&page=N&perPage=100&_routes=pages/SearchPage
-//   - Ficha:       GET {baseUrl}/manga/{id}.data?_routes=pages/MangaDetailPage
-//   - Capítulos:   GET {baseUrl}/api/manga/{id}/chapters/list
-//   - Páginas:     GET {baseUrl}/api/chapters/{chapterId}/images
-//                  (o /api/uploads/{chapterId}/images si el capítulo tiene group_name,
-//                   es decir viene marcado con "?source=user" en la URL original)
-//
-// ⚠️ El manifiesto original marca "hasCloudflare": true y trae de fábrica un
-// "proxy-use" activado por defecto (para saltar un challenge de Cloudflare vía un
-// proxy externo). Aquí se hacen peticiones directas con harbor.http; si el sitio
-// devuelve un challenge/captcha en vez de JSON, ese es el motivo — no hay forma de
-// resolverlo sin un proxy o navegador headless externo.
-
 const BASE_URL = "https://mangadot.net";
 const API_URL = `${BASE_URL}/api`;
 const PAGE_SIZE = 100; // "perPage" usado por la extensión original (this.total = 100)
@@ -41,11 +9,18 @@ async function fetchJson(url) {
     responseType: "text",
     headers: { Referer: `${BASE_URL}/` },
   });
-  if (!res.ok) return null;
+  if (!res.ok) {
+    throw new Error(
+      `mangadot: HTTP ${res.status} en ${url} — body: ${String(res.body).slice(0, 300)}`,
+    );
+  }
   try {
     return JSON.parse(res.body);
   } catch (e) {
-    return null;
+    // No era JSON — casi seguro un challenge de Cloudflare u otra página HTML.
+    throw new Error(
+      `mangadot: respuesta no-JSON en ${url} — body: ${String(res.body).slice(0, 300)}`,
+    );
   }
 }
 
@@ -332,6 +307,4 @@ const plugin = {
   },
 };
 
-harbor.register(plugin);
- 
 harbor.register(plugin);
