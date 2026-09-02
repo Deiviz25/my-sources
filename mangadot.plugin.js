@@ -171,6 +171,35 @@ function mangaFromNode(manga) {
   };
 }
 
+// Busca un objeto que tenga id y title (propiedades de manga) en la respuesta hidratada
+function findMangaInHydrated(hydrated) {
+  if (!hydrated) return null;
+  
+  // Si es un objeto con id y title directamente, es el manga
+  if (hydrated.id && hydrated.title) {
+    return hydrated;
+  }
+  
+  // Si es un objeto, buscar en propiedades comunes
+  if (typeof hydrated === "object" && !Array.isArray(hydrated)) {
+    // Prioridad: manga > data > content > result
+    if (hydrated.manga && hydrated.manga.id && hydrated.manga.title) {
+      return hydrated.manga;
+    }
+    if (hydrated.data && hydrated.data.id && hydrated.data.title) {
+      return hydrated.data;
+    }
+    if (hydrated.content && hydrated.content.id && hydrated.content.title) {
+      return hydrated.content;
+    }
+    if (hydrated.result && hydrated.result.id && hydrated.result.title) {
+      return hydrated.result;
+    }
+  }
+  
+  return null;
+}
+
 // --- MangaProvider -------------------------------------------------------
 
 const plugin = {
@@ -239,39 +268,42 @@ const plugin = {
   },
 
   async detail(id) {
-  const url = `${BASE_URL}/manga/${encodeURIComponent(id)}.data?_routes=pages/MangaDetailPage`;
-  harbor.log(`mangadot: detail() pidiendo ${url}`);
-  const json = await fetchJson(url);
-  
-  if (!json) {
-    harbor.log("mangadot: detail() recibió null");
-    return null;
-  }
+    const url = `${BASE_URL}/manga/${encodeURIComponent(id)}.data?_routes=pages/MangaDetailPage`;
+    const json = await fetchJson(url);
+    if (!json) return null;
 
-  harbor.log("mangadot: detail() json keys:", Object.keys(json).slice(0, 15));
-  
-  // Probar múltiples índices
-  let mangaNode = null;
-  for (let idx of [8, 7, 6, 5, 4, 3, 2, 1, 0]) {
-    const attempt = hydrate(idx, json);
-    if (attempt && attempt.title) {
-      harbor.log(`mangadot: detail() encontró manga en índice ${idx}`);
-      mangaNode = attempt;
-      break;
+    // Intentar múltiples índices para encontrar el manga
+    // (el sitio puede haber cambiado su estructura de hidrataci��n)
+    let mangaNode = null;
+    const tableCopy = json.slice ? Array.from(json) : json; // asegurar que es array
+    
+    // Probar de mayor a menor para encontrar el manga
+    for (let idx = 20; idx >= 0; idx--) {
+      try {
+        const attempt = hydrate(idx, tableCopy);
+        const found = findMangaInHydrated(attempt);
+        if (found) {
+          mangaNode = found;
+          harbor.log(`mangadot: detail() encontró manga en índice ${idx}`);
+          break;
+        }
+      } catch (e) {
+        // ignorar errores de hydrate en índices inválidos
+        continue;
+      }
     }
-  }
-  
-  if (!mangaNode) {
-    harbor.log("mangadot: detail() no encontró manga en ningún índice");
-    return null;
-  }
 
-  const base = mangaFromNode(mangaNode);
-  const chapters = await plugin.chapters(id);
-  base.lastChapter = chapters.length ? chapters[chapters.length - 1].chapter : undefined;
-  return base;
-},
-  
+    if (!mangaNode) {
+      harbor.log("mangadot: detail() no encontró manga válido");
+      return null;
+    }
+
+    const base = mangaFromNode(mangaNode);
+    const chapters = await plugin.chapters(id);
+    base.lastChapter = chapters.length ? chapters[chapters.length - 1].chapter : undefined;
+    return base;
+  },
+
   // El endpoint ya devuelve el array completo y ordenado por fecha (no hay
   // paginación en la extensión original: hace una sola petición y ya está).
   async chapters(id) {
