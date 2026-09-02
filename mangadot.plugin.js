@@ -1,264 +1,337 @@
 // mangadot.net — Harbor MangaProvider plugin
 //
-// Migrado desde un provider de Seanime (formato distinto: usa fetch directo,
-// class Provider, devuelve campos como `image`/`synonyms` en vez del shape
-// de Harbor). Esto NO es un port 1:1 — Harbor exige otra interfaz, otro
-// bridge de red (harbor.http, no fetch) y otro shape de retorno, así que
-// cada método se reescribió desde cero contra esa interfaz.
+// Portado directamente del código fuente real de la extensión Mangayomi/Tachiyomi
+// para mangadot.net (que el usuario proporcionó descompilada del .apk). Todos los
+// endpoints, parámetros y la lógica de "hydrate" vienen confirmados de ese código,
+// no son heurísticas inventadas.
 //
-// ✅ Confirmado contra HTML real (portada, ficha de "Drawn to the Fire",
-// página de lectura del capítulo 15):
-//   - Portada: tarjetas <a class="group flex flex-col gap-1.5"
-//     href="/manga/ID">...<img src="PORTADA">...<div class="line-clamp-2
-//     ...">TÍTULO</div></a> en las secciones "Latest Updates", "Recently
-//     Added", "Most Tracked" y "Top Rated" — SÍ vienen en el HTML inicial
-//     (no solo en el JSON de hidratación de React), así que se pueden leer
-//     con regex sin ejecutar JS.
-//   - Ficha: título en <h1 class="text-2xl ... font-black text-white...">,
-//     portada en el <img loading="eager" fetchPriority="high">, sinopsis en
-//     el div de resumen, estado junto al punto de color (Ongoing/Completed),
-//     autor en la fila "Author" de la barra lateral.
-//   - Los géneros de una ficha enlazan a /search?search=<Género> — confirma
-//     que filtrar por género en este sitio ES una búsqueda por ese texto,
-//     no un slug de categoría aparte. tags()/_byGenre() usan justo eso.
+// El sitio es una app React Router v7 (SSR). Las páginas normales devuelven HTML,
+// pero añadiendo ".data" a la ruta (y el query param _routes) el servidor devuelve
+// el payload de hidratación en un formato compacto: un array plano donde muchos
+// valores son índices que apuntan a otras posiciones del mismo array (para
+// deduplicar objetos repetidos). hydrate() reconstruye el árbol real a partir de
+// ese formato — es el mismo mecanismo que produce los <script>...streamController
+// .enqueue(...)</script> que se ven en el HTML normal, solo que en .data viene ya
+// aislado y sin el resto de la página.
 //
-// ⚠️ SIN CONFIRMAR — heredado del provider de Seanime original, no
-// verificado por mí contra una respuesta real:
-//   1. chapters() y pageUrls() NO tocan HTML: usan las mismas rutas de API
-//      que ya traía el provider de Seanime
-//      (/api/manga/{id}/chapters/list?lang=en y
-//      /api/chapters/{id}/images). La página de ficha SÍ confirma que existe
-//      una carga asíncrona ahí (el tab de capítulos muestra un spinner
-//      "Loading chapters..." en vez de venir en el HTML), así que una API así
-//      existe seguro — pero no vi la respuesta JSON real, solo heredé el
-//      parseo que ya traía el provider (campos chapter_number,
-//      chapter_title, scanlator_name/group_name, language, images[].url).
-//      Si chapters()/pageUrls() devuelven vacío, es la primera zona a
-//      revisar con una captura real de esas dos respuestas.
-//   2. /search?search=...&page=N: el patrón viene del provider original;
-//      no tengo el HTML de una página de resultados real para confirmar
-//      que reutiliza la misma tarjeta que la portada (la sección "You may
-//      also like" de la ficha usa una tarjeta distinta, más pequeña, así
-//      que no puedo asumir que todas las tarjetas del sitio son iguales).
-//      Si search()/tags() no devuelven nada, esto es lo primero a revisar.
-//   3. tags(): no había ninguna página de categorías/géneros en lo que me
-//      pasaste, así que esta lista es una selección manual armada con los
-//      géneros que sí aparecieron en las muestras (ficha + JSON de
-//      hidratación de la portada). Seguro que faltan géneros del catálogo
-//      real — mándame el HTML de la página de categorías si existe.
+// Endpoints confirmados:
+//   - Populares:   GET {baseUrl}/view-all/most-tracked.data?adult=1&page=N&_routes=pages/ViewAllPage
+//   - Recientes:   GET {baseUrl}/view-all/latest-updates.data?adult=1&page=N&_routes=pages/ViewAllPage
+//   - Búsqueda:    GET {baseUrl}/search.data?search=...&adult=1&page=N&perPage=100&_routes=pages/SearchPage
+//   - Ficha:       GET {baseUrl}/manga/{id}.data?_routes=pages/MangaDetailPage
+//   - Capítulos:   GET {baseUrl}/api/manga/{id}/chapters/list
+//   - Páginas:     GET {baseUrl}/api/chapters/{chapterId}/images
+//                  (o /api/uploads/{chapterId}/images si el capítulo tiene group_name,
+//                   es decir viene marcado con "?source=user" en la URL original)
 //
-// ⚠️ Igual que con leercapitulo: el provider original mandaba `Referer` a
-// mano en cada fetch (típico de APIs con protección anti-hotlink). Harbor
-// elimina esa cabecera de toda llamada harbor.http sin excepción — si
-// /api/chapters/{id}/images la exige, las imágenes fallarán y no hay forma
-// de arreglarlo desde este archivo.
- 
+// ⚠️ El manifiesto original marca "hasCloudflare": true y trae de fábrica un
+// "proxy-use" activado por defecto (para saltar un challenge de Cloudflare vía un
+// proxy externo). Aquí se hacen peticiones directas con harbor.http; si el sitio
+// devuelve un challenge/captcha en vez de JSON, ese es el motivo — no hay forma de
+// resolverlo sin un proxy o navegador headless externo.
+
 const BASE_URL = "https://mangadot.net";
-const PAGE_SIZE = 48; // MANGA_PAGE: offset -> página
- 
-// --- helpers de red --------------------------------------------------------
- 
-async function fetchText(path) {
-  const res = await harbor.http(`${BASE_URL}${path}`, { responseType: "text" });
+const API_URL = `${BASE_URL}/api`;
+const PAGE_SIZE = 100; // "perPage" usado por la extensión original (this.total = 100)
+
+// --- helpers -----------------------------------------------------------
+
+async function fetchJson(url) {
+  const res = await harbor.http(url, {
+    responseType: "text",
+    headers: { Referer: `${BASE_URL}/` },
+  });
   if (!res.ok) return null;
-  return res.body;
-}
- 
-async function fetchJson(path) {
-  return harbor.http(`${BASE_URL}${path}`, { responseType: "json" });
-}
- 
-function absoluteUrl(url) {
-  if (!url) return undefined;
   try {
-    return new URL(url, BASE_URL).toString();
+    return JSON.parse(res.body);
   } catch (e) {
-    return undefined;
+    return null;
   }
 }
- 
-function decodeEntities(str) {
+
+function absoluteUrl(path) {
+  if (!path) return undefined;
+  return path.startsWith("http") ? path : `${BASE_URL}${path}`;
+}
+
+// El sitio mete UTF-8 mal decodificado como Latin-1 en algunos campos (títulos con
+// caracteres no-ASCII). Esto revierte ese doble-encoding, tal cual lo hace la
+// extensión original.
+function fixMojibake(str) {
   if (!str) return str;
-  return str
-    .replace(/&quot;/g, '"')
-    .replace(/&#x27;/g, "'")
-    .replace(/&#0?39;/g, "'")
-    .replace(/&amp;/g, "&")
-    .replace(/&nbsp;/g, " ")
-    .replace(/<!--\s*-->/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
- 
-// --- tarjetas de manga (portada / búsqueda / género) ------------------------
-// Confirmado contra la portada real: <a class="group flex flex-col
-// gap-1.5" href="/manga/ID">...<img src="COVER">...<div
-// class="line-clamp-2 ...">TÍTULO</div></a>. El id que guardamos es solo el
-// número (p. ej. "23467"), porque las rutas de la API de capítulos/páginas
-// heredadas del provider de Seanime lo usan tal cual, sin el prefijo
-// "/manga/".
-function parseMangaCards(html) {
-  const cardRe =
-    /<a class="group flex flex-col gap-1\.5" href="\/manga\/(\d+)"[^>]*>[\s\S]*?<img src="([^"]+)"[\s\S]*?<div class="line-clamp-2[^"]*">([\s\S]*?)<\/div><\/a>/g;
- 
-  const seen = new Set();
-  const results = [];
- 
-  let m;
-  while ((m = cardRe.exec(html)) !== null) {
-    const id = m[1];
-    const cover = m[2];
-    const title = decodeEntities(m[3]);
-    if (!id || !title || seen.has(id)) continue;
-    seen.add(id);
- 
-    results.push({ id, title, cover: absoluteUrl(cover) });
+  let out = "";
+  for (let i = 0; i < str.length; i++) {
+    out += String.fromCharCode(str.charCodeAt(i) & 0xff);
   }
- 
-  return results;
+  try {
+    return decodeURIComponent(escape(out));
+  } catch (e) {
+    return str;
+  }
 }
- 
-// --- MangaProvider -----------------------------------------------------
- 
+
+// Reconstruye el árbol real a partir del payload de hidratación de React Router.
+// Copiado tal cual de la extensión original.
+function hydrate(rootIndex, table) {
+  const seen = new Map();
+  function resolve(value) {
+    if (value === -5) return null;
+    if (typeof value === "number" && typeof table[value] === "string") {
+      const s = table[value].trim();
+      if (s[0] === "[" && s[s.length - 1] === "]") {
+        try {
+          return JSON.parse(s);
+        } catch (e) {
+          // no era JSON, se trata como string normal más abajo
+        }
+      }
+    }
+    if (typeof value === "number" && table[value] !== undefined) {
+      return walk(table[value]);
+    }
+    return walk(value);
+  }
+  function walk(node) {
+    if (node == null) return node;
+    if (seen.has(node)) return seen.get(node);
+    if (Array.isArray(node)) {
+      return node.map(resolve);
+    }
+    if (typeof node === "object") {
+      const out = {};
+      seen.set(node, out);
+      for (const [k, v] of Object.entries(node)) {
+        if (k.startsWith("_")) {
+          const realKey = table[Number(k.slice(1))];
+          out[realKey] = resolve(v);
+        } else {
+          out[k] = resolve(v);
+        }
+      }
+      return out;
+    }
+    return node;
+  }
+  return resolve(rootIndex);
+}
+
+function buildParams(params) {
+  const parts = [];
+  for (const [key, value] of Object.entries(params)) {
+    const k = encodeURIComponent(key);
+    if (Array.isArray(value)) {
+      for (const v of value) parts.push(`${k}=${encodeURIComponent(v)}`);
+    } else if (value != null) {
+      parts.push(`${k}=${encodeURIComponent(value)}`);
+    }
+  }
+  return parts.join("&");
+}
+
+const STATUS_MAP = {
+  Ongoing: "ongoing",
+  Completed: "completed",
+  on_hiatus: "hiatus",
+  unknown: "unknown",
+};
+
+function mangaFromNode(manga) {
+  const status =
+    manga.hiatus && manga.hiatus !== "No"
+      ? STATUS_MAP.on_hiatus
+      : STATUS_MAP[manga.status] || STATUS_MAP.unknown;
+
+  return {
+    id: String(manga.id),
+    title: fixMojibake(manga.title),
+    cover: absoluteUrl(manga.photo),
+    description: fixMojibake(manga.description),
+    status,
+    genres: manga.genres || undefined,
+    author: manga.authors && manga.authors.length ? manga.authors.join(" & ") : undefined,
+    artist: manga.artists && manga.artists.length ? manga.artists.join(" & ") : undefined,
+  };
+}
+
+// --- MangaProvider -------------------------------------------------------
+
 const plugin = {
   id: "mangadot",
-  name: "MangaDot",
- 
-  // La portada trae 4 secciones curadas (Latest Updates, Recently Added,
-  // Most Tracked, Top Rated) confirmadas contra HTML real; se combinan y
-  // deduplican por id. No hay paginación de portada, así que offset > 0
-  // pasa a usar /search con página calculada como fallback best-effort
-  // (ver aviso #2 al inicio del archivo).
+  name: "Mangadotnet",
+
+  // offset se traduce a página (1-based) usando PAGE_SIZE como tamaño de página,
+  // igual que hace la extensión original con this.total = 100.
   async popular(offset, tagId) {
-    if (tagId) return plugin._byGenre(tagId, offset);
-    if (offset > 0) return [];
- 
-    const html = await fetchText("/");
-    if (!html) return [];
- 
-    return parseMangaCards(html).slice(0, PAGE_SIZE);
-  },
- 
-  // ⚠️ Sin confirmar (aviso #2): asumo que /search reutiliza la misma
-  // tarjeta que la portada.
-  async _byGenre(tagId, offset) {
+    if (tagId) return plugin._byGenre(tagId, offset, "tracked");
+
     const page = Math.floor(offset / PAGE_SIZE) + 1;
-    const html = await fetchText(`/search?search=${encodeURIComponent(tagId)}&page=${page}`);
-    if (!html) return [];
-    return parseMangaCards(html).slice(0, PAGE_SIZE);
+    const json = await fetchJson(
+      `${BASE_URL}/view-all/most-tracked.data?adult=1&page=${page}&_routes=pages/ViewAllPage`,
+    );
+    if (!json) return [];
+
+    // 7 = {manga_list, pagination} — índice confirmado en el código fuente original.
+    const hydrated = hydrate(7, json);
+    if (!hydrated || !hydrated.manga_list) return [];
+
+    return hydrated.manga_list.map(mangaFromNode);
   },
- 
+
+  async _byGenre(tagId, offset, sortBy) {
+    const page = Math.floor(offset / PAGE_SIZE) + 1;
+    const params = {
+      genre: [tagId],
+      adult: 1,
+      page,
+      perPage: PAGE_SIZE,
+      _routes: "pages/SearchPage",
+    };
+    if (sortBy) params.sortBy = sortBy;
+
+    const json = await fetchJson(`${BASE_URL}/search.data?${buildParams(params)}`);
+    if (!json) return [];
+
+    // 4 = {allGenres,displayMode,filters,page,pagination,query,results}
+    const hydrated = hydrate(4, json);
+    if (!hydrated || !hydrated.results) return [];
+
+    return hydrated.results.map(mangaFromNode);
+  },
+
   async search(query, offset, tagId) {
     if (!query && tagId) return plugin._byGenre(tagId, offset);
- 
+
     const page = Math.floor(offset / PAGE_SIZE) + 1;
-    const html = await fetchText(`/search?search=${encodeURIComponent(query)}&page=${page}`);
-    if (!html) return [];
- 
-    return parseMangaCards(html).slice(0, PAGE_SIZE);
-  },
- 
-  async detail(id) {
-    const html = await fetchText(`/manga/${id}`);
-    if (!html) return null;
- 
-    const titleMatch = html.match(
-      /<h1 class="text-2xl md:text-\[30px\] font-black text-white[^"]*">([^<]+)<\/h1>/,
-    );
-    const coverMatch = html.match(
-      /<img src="([^"]+)"[^>]*loading="eager" fetchPriority="high"/,
-    );
-    const statusMatch = html.match(
-      /<span class="w-1\.5 h-1\.5 rounded-full bg-[a-z]+-500"><\/span>([^<]+)<\/span>/,
-    );
-    const descMatch = html.match(
-      /<div class="text-sm text-white\/60 leading-\[1\.7\][^"]*">\s*<div>([\s\S]*?)<\/div>\s*<\/div>/,
-    );
-    const authorMatch = html.match(
-      /Author<\/span><span[^>]*>(?:<span[^>]*>)?<a[^>]*>([^<]+)<\/a>/,
-    );
- 
-    const description = descMatch
-      ? decodeEntities(descMatch[1].replace(/<br\s*\/?>/gi, "\n"))
-      : undefined;
- 
-    const chapters = await plugin.chapters(id);
-    const lastChapter = chapters.length
-      ? chapters[chapters.length - 1].chapter
-      : undefined;
- 
-    return {
-      id,
-      title: titleMatch ? decodeEntities(titleMatch[1]) : id,
-      cover: absoluteUrl(coverMatch?.[1]),
-      description,
-      status: statusMatch ? decodeEntities(statusMatch[1]).toLowerCase() : undefined,
-      author: authorMatch ? decodeEntities(authorMatch[1]) : undefined,
-      lastChapter,
+    const params = {
+      adult: 1,
+      page,
+      perPage: PAGE_SIZE,
+      _routes: "pages/SearchPage",
     };
+    if (query) params.search = query;
+    if (tagId) params.genre = [tagId];
+
+    const json = await fetchJson(`${BASE_URL}/search.data?${buildParams(params)}`);
+    if (!json) return [];
+
+    const hydrated = hydrate(4, json);
+    if (!hydrated || !hydrated.results) return [];
+
+    return hydrated.results.map(mangaFromNode);
   },
- 
-  // ⚠️ Sin confirmar contra una respuesta real (aviso #1). La ficha SÍ
-  // confirma que esta carga es asíncrona (spinner "Loading chapters..."),
-  // así que la API existe; el parseo de campos viene heredado del
-  // provider de Seanime.
+
+  async detail(id) {
+    const json = await fetchJson(
+      `${BASE_URL}/manga/${encodeURIComponent(id)}.data?_routes=pages/MangaDetailPage`,
+    );
+    if (!json) return null;
+
+    // 8 es el índice del nodo "manga" dentro del payload de MangaDetailPage,
+    // confirmado en el código fuente original (getDetail -> hydrate(8, ...)).
+    const mangaNode = hydrate(8, json);
+    if (!mangaNode) return null;
+
+    const base = mangaFromNode(mangaNode);
+    const chapters = await plugin.chapters(id);
+    base.lastChapter = chapters.length ? chapters[chapters.length - 1].chapter : undefined;
+    return base;
+  },
+
+  // El endpoint ya devuelve el array completo y ordenado por fecha (no hay
+  // paginación en la extensión original: hace una sola petición y ya está).
   async chapters(id) {
-    const json = await fetchJson(`/api/manga/${id}/chapters/list?lang=en`);
-    const items = Array.isArray(json) ? json : [];
- 
-    const chapters = items
-      .map((ch) => {
-        const chId = ch?.id != null ? String(ch.id) : null;
-        if (!chId) return null;
- 
-        const number = ch?.chapter_number != null ? String(ch.chapter_number) : null;
-        const title = ch?.chapter_title ? decodeEntities(String(ch.chapter_title)) : undefined;
-        const group =
-          (ch?.scanlator_name && String(ch.scanlator_name).trim()) ||
-          (ch?.group_name && String(ch.group_name).trim()) ||
-          undefined;
- 
+    const json = await fetchJson(`${API_URL}/manga/${encodeURIComponent(id)}/chapters/list`);
+    if (!Array.isArray(json)) return [];
+
+    const chapters = json
+      .map((c) => {
+        if (c == null || c.id == null) return null;
+        const chapNum = c.chapter_number != null ? String(c.chapter_number) : "0";
+        const hasGroup = c.group_name && String(c.group_name).length;
+        const title =
+          c.chapter_title && String(c.chapter_title).length
+            ? fixMojibake(c.chapter_title)
+            : `${c.volume_number ? "Volume " + c.volume_number + " " : ""}Chapter ${chapNum}`;
+
         return {
-          id: chId,
-          chapter: number,
+          // El sufijo "?source=user" indica que las páginas viven bajo /api/uploads/
+          // en vez de /api/chapters/ — lo codificamos en el propio id para que
+          // pageUrls() sepa qué endpoint usar sin peticiones extra.
+          id: hasGroup ? `${c.id}?source=user` : String(c.id),
+          chapter: chapNum,
           title,
           pages: 0,
-          language: ch?.language ? String(ch.language) : "en",
-          group,
+          language: "en",
+          publishAt: c.date_added || undefined,
+          scanlator: hasGroup ? String(c.group_name) : "Official",
         };
       })
       .filter(Boolean);
- 
-    chapters.sort((a, b) => parseFloat(a.chapter ?? "0") - parseFloat(b.chapter ?? "0"));
+
+    chapters.sort((a, b) => parseFloat(a.chapter) - parseFloat(b.chapter));
     return chapters;
   },
- 
-  // ⚠️ Sin confirmar (aviso #1 y aviso sobre Referer al inicio del archivo).
+
   async pageUrls(chapterId) {
-    const json = await fetchJson(`/api/chapters/${chapterId}/images`);
-    const images = Array.isArray(json?.images) ? json.images : [];
- 
-    return images
-      .map((img) => absoluteUrl(img?.url))
-      .filter(Boolean);
+    const isUserUpload = chapterId.includes("?source=user");
+    const rawId = isUserUpload ? chapterId.split("?")[0] : chapterId;
+    const endpoint = isUserUpload
+      ? `${API_URL}/uploads/${encodeURIComponent(rawId)}/images`
+      : `${API_URL}/chapters/${encodeURIComponent(rawId)}/images`;
+
+    const json = await fetchJson(endpoint);
+    if (!json || !Array.isArray(json.images)) return [];
+
+    return json.images.map((img) => absoluteUrl(img.url)).filter(Boolean);
   },
- 
-  // ⚠️ Lista armada a mano con los géneros vistos en las muestras (aviso #3),
-  // no scrapeada de una página de categorías real. El id es literalmente el
-  // texto que el sitio espera en /search?search=<id> — confirmado porque
-  // los enlaces de género de la ficha usan ese mismo patrón.
+
+  // Lista de géneros confirmada del getFilterList() original (GenreFilter).
+  // El sitio trae duplicados con distinta capitalización (p.ej. "action"/"Action")
+  // como valores de filtro independientes — se preservan tal cual, ya que son
+  // valores de query reales y no un error de scraping.
   async tags() {
     const GENRES = [
-      "Action", "Adventure", "Comedy", "Drama", "Fantasy", "Sci-Fi",
-      "Slice of Life", "Sports", "School Life", "Shounen", "Shoujo",
-      "Seinen", "Josei", "Isekai", "Mecha", "Horror", "Mystery",
-      "Psychological", "Romance", "Supernatural", "Tragedy", "Ecchi",
-      "Harem", "Mature", "Adult", "Boys Love", "Girls Love", "Historical",
-      "Martial Arts", "Military", "Crime", "Thriller",
+      "Academy", "Acting", "action", "Action", "Adeventure", "adult", "Adult",
+      "adventure", "Adventure", "Aliens", "and slice-of-life", "Animals",
+      "Anthology", "Avant Garde", "award_winning", "Award winning",
+      "Award Winning", "Based on an Anime", "boys' love", "boys_love",
+      "Boys Love", "Boys' Love", "Bully", "business", "child abuse",
+      "child neglect", "comedy", "Comedy", "Comic", "Cooking", "Crime",
+      "Crossdressing", "Delinquents", "Demons", "difficult childhood",
+      "doujinshi", "Doujinshi", "drama", "Drama", "ecchi", "Ecchi", "erotica",
+      "Erotica", "fantasy", "Fantasy", "female protagonist", "femdom",
+      "Fight", "Fluff", "gender_bender", "Gender bender", "Gender Bender",
+      "Genderswap", "Genius MC", "Ghosts", "girls_love", "Girls love",
+      "Girls Love", "Girls' Love", "gore", "Gourmet", "Gyaru", "harem",
+      "Harem", "hentai", "Hentai", "historical", "Historical", "horror",
+      "Horror", "Hunters", "Idol", "Idols", "Incest", "Isekai", "josei",
+      "Josei", "Loli", "Lolicon", "Mafia", "magic", "Magic", "Magical Girls",
+      "mahou_shoujo", "Mahou Shoujo", "manga", "Manga", "Mangatoon", "manhua",
+      "Manhua", "manhwa", "Manhwa", "martial arts", "martial_arts",
+      "Martial arts", "Martial Arts", "mature", "Mature", "mecha", "Mecha",
+      "Medical", "Medicaldrama", "medieval area", "military", "Military",
+      "Monster Girls", "monsters", "Monsters", "music", "Music", "mystery",
+      "Mystery", "myth", "naruto", "Ninja", "nobility", "office worker",
+      "office workers", "Office Workers", "Official", "One Shot", "Otome",
+      "Philosophical", "Police", "politics", "Post-Apocalyptic",
+      "psychological", "Psychological", "red flag", "reincarnation",
+      "Reincarnation", "Reverse Harem", "romance", "Romance", "royalty",
+      "Samurai", "school_life", "School life", "School_life", "School Life",
+      "sci-fi", "Sci-fi", "Sci-Fi", "seinen", "Seinen", "Shota", "Shotacon",
+      "shoujo", "Shoujo", "shoujo_ai", "Shoujo Ai", "shounen", "Shounen",
+      "shounen_ai", "Shounen Ai", "slice_of_life", "Slice of life",
+      "Slice of Life", "smut", "Smut", "sports", "Sports", "Superhero",
+      "supernatural", "Supernatural", "Survival", "suspense", "Suspense",
+      "system", "System", "thriller", "Thriller", "Time Travel",
+      "Traditional Games", "tragedy", "Tragedy", "Vampires", "Video Games",
+      "Villainess", "Virtual Reality", "War", "webtoon", "Webtoon",
+      "webtoons", "wuxia", "Wuxia", "yaoi", "Yaoi", "yuri", "Yuri", "Zombies",
     ];
- 
-    return GENRES.map((name) => ({ id: name, name }));
+
+    return GENRES.map((g) => ({ id: g, name: g }));
   },
 };
+
+harbor.register(plugin);
  
 harbor.register(plugin);
