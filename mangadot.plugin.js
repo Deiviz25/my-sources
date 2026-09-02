@@ -42,25 +42,28 @@ const BROWSER_UA =
 async function fetchJson(url) {
   // Nota: harbor.http elimina "referer" aunque lo mandemos, así que no lo incluimos.
   // "user-agent" es la única cabecera de camuflaje de navegador que sí se respeta.
-  const res = await harbor.http(url, {
-    responseType: "text",
-    headers: {
-      "user-agent": BROWSER_UA,
-      accept: "application/json, text/plain, */*",
-    },
-  });
-  if (!res.ok) {
-    throw new Error(
-      `mangadot: HTTP ${res.status} en ${url} — body: ${String(res.body).slice(0, 300)}`,
-    );
-  }
   try {
-    return JSON.parse(res.body);
+    const res = await harbor.http(url, {
+      responseType: "text",
+      headers: {
+        "user-agent": BROWSER_UA,
+        accept: "application/json, text/plain, */*",
+      },
+    });
+    if (!res.ok) {
+      harbor.log(`mangadot: HTTP ${res.status} en ${url} — body:`, String(res.body).slice(0, 300));
+      return null;
+    }
+    try {
+      return JSON.parse(res.body);
+    } catch (e) {
+      // No era JSON — casi seguro un challenge de Cloudflare u otra página HTML.
+      harbor.log("mangadot: respuesta no-JSON en", url, "— body:", String(res.body).slice(0, 300));
+      return null;
+    }
   } catch (e) {
-    // No era JSON — casi seguro un challenge de Cloudflare u otra página HTML.
-    throw new Error(
-      `mangadot: respuesta no-JSON en ${url} — body: ${String(res.body).slice(0, 300)}`,
-    );
+    harbor.log("mangadot: excepción de red en", url, "—", String(e));
+    return null;
   }
 }
 
@@ -247,15 +250,8 @@ const plugin = {
     if (!mangaNode) return null;
 
     const base = mangaFromNode(mangaNode);
-    try {
-      const chapters = await plugin.chapters(id);
-      base.lastChapter = chapters.length ? chapters[chapters.length - 1].chapter : undefined;
-    } catch (e) {
-      // Si /api/manga/{id}/chapters/list falla (p.ej. bloqueado aparte de la
-      // página en sí), que al menos se vea la info de la ficha; chapters()
-      // se llama de nuevo por separado y ahí sí se propaga el error real.
-      harbor.log("mangadot: detail() no pudo obtener capítulos:", String(e));
-    }
+    const chapters = await plugin.chapters(id);
+    base.lastChapter = chapters.length ? chapters[chapters.length - 1].chapter : undefined;
     return base;
   },
 
