@@ -1,47 +1,19 @@
 // mangadot.net — Harbor MangaProvider plugin
 //
-// Portado directamente del código fuente real de la extensión Mangayomi/Tachiyomi
-// para mangadot.net (que el usuario proporcionó descompilada del .apk). Todos los
-// endpoints, parámetros y la lógica de "hydrate" vienen confirmados de ese código,
-// no son heurísticas inventadas.
-//
-// El sitio es una app React Router v7 (SSR). Las páginas normales devuelven HTML,
-// pero añadiendo ".data" a la ruta (y el query param _routes) el servidor devuelve
-// el payload de hidratación en un formato compacto: un array plano donde muchos
-// valores son índices que apuntan a otras posiciones del mismo array (para
-// deduplicar objetos repetidos). hydrate() reconstruye el árbol real a partir de
-// ese formato — es el mismo mecanismo que produce los <script>...streamController
-// .enqueue(...)</script> que se ven en el HTML normal, solo que en .data viene ya
-// aislado y sin el resto de la página.
-//
-// Endpoints confirmados:
-//   - Populares:   GET {baseUrl}/view-all/most-tracked.data?adult=1&page=N&_routes=pages/ViewAllPage
-//   - Recientes:   GET {baseUrl}/view-all/latest-updates.data?adult=1&page=N&_routes=pages/ViewAllPage
-//   - Búsqueda:    GET {baseUrl}/search.data?search=...&adult=1&page=N&perPage=100&_routes=pages/SearchPage
-//   - Ficha:       GET {baseUrl}/manga/{id}.data?_routes=pages/MangaDetailPage
-//   - Capítulos:   GET {baseUrl}/api/manga/{id}/chapters/list
-//   - Páginas:     GET {baseUrl}/api/chapters/{chapterId}/images
-//                  (o /api/uploads/{chapterId}/images si el capítulo tiene group_name,
-//                   es decir viene marcado con "?source=user" en la URL original)
-//
-// ⚠️ El manifiesto original marca "hasCloudflare": true y trae de fábrica un
-// "proxy-use" activado por defecto (para saltar un challenge de Cloudflare vía un
-// proxy externo). Aquí se hacen peticiones directas con harbor.http; si el sitio
-// devuelve un challenge/captcha en vez de JSON, ese es el motivo — no hay forma de
-// resolverlo sin un proxy o navegador headless externo.
+// ATENCIÓN: El sitio usa React Router v7 con hidratación SSR. 
+// Los endpoints `/api/` pueden no devolver JSON debido a Cloudflare.
+// Alternativa: parsear el HTML de las páginas y extraer datos del React hydration payload.
 
 const BASE_URL = "https://mangadot.net";
 const API_URL = `${BASE_URL}/api`;
-const PAGE_SIZE = 100; // "perPage" usado por la extensión original (this.total = 100)
-
-// --- helpers -----------------------------------------------------------
+const PAGE_SIZE = 100;
 
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
 
+// --- Helpers ---
+
 async function fetchJson(url) {
-  // Nota: harbor.http elimina "referer" aunque lo mandemos, así que no lo incluimos.
-  // "user-agent" es la única cabecera de camuflaje de navegador que sí se respeta.
   try {
     const res = await harbor.http(url, {
       responseType: "text",
@@ -51,18 +23,56 @@ async function fetchJson(url) {
       },
     });
     if (!res.ok) {
-      harbor.log(`mangadot: HTTP ${res.status} en ${url} — body:`, String(res.body).slice(0, 300));
+      harbor.log(`❌ HTTP ${res.status} en ${url}`);
       return null;
     }
     try {
-      return JSON.parse(res.body);
+      const parsed = JSON.parse(res.body);
+      harbor.log(`✓ JSON ok desde ${url.split("?")[0]}`);
+      return parsed;
     } catch (e) {
-      // No era JSON — casi seguro un challenge de Cloudflare u otra página HTML.
-      harbor.log("mangadot: respuesta no-JSON en", url, "— body:", String(res.body).slice(0, 300));
+      harbor.log(`❌ NO-JSON en ${url} — intentando parsear HTML...`);
       return null;
     }
   } catch (e) {
-    harbor.log("mangadot: excepción de red en", url, "—", String(e));
+    harbor.log(`❌ NETWORK error: ${String(e).slice(0, 100)}`);
+    return null;
+  }
+}
+
+async function fetchHtml(url) {
+  try {
+    const res = await harbor.http(url, {
+      responseType: "text",
+      headers: {
+        "user-agent": BROWSER_UA,
+      },
+    });
+    if (!res.ok) {
+      harbor.log(`❌ HTML HTTP ${res.status} en ${url}`);
+      return null;
+    }
+    return res.body;
+  } catch (e) {
+    harbor.log(`❌ HTML NETWORK: ${String(e).slice(0, 100)}`);
+    return null;
+  }
+}
+
+// Extrae el payload React hydration del HTML
+// Busca: window.__reactRouterContext.streamController.enqueue("[{...}]")
+function extractHydrationPayload(html) {
+  const match = html.match(/streamController\.enqueue\("(.+?)"\);/);
+  if (!match) {
+    harbor.log("❌ No se encontró hydration payload en HTML");
+    return null;
+  }
+  try {
+    const payload = JSON.parse(match[1]);
+    harbor.log("✓ Hydration payload extraído del HTML");
+    return payload;
+  } catch (e) {
+    harbor.log("❌ No se pudo parsear hydration payload:", String(e).slice(0, 100));
     return null;
   }
 }
@@ -72,9 +82,6 @@ function absoluteUrl(path) {
   return path.startsWith("http") ? path : `${BASE_URL}${path}`;
 }
 
-// El sitio mete UTF-8 mal decodificado como Latin-1 en algunos campos (títulos con
-// caracteres no-ASCII). Esto revierte ese doble-encoding, tal cual lo hace la
-// extensión original.
 function fixMojibake(str) {
   if (!str) return str;
   let out = "";
@@ -88,8 +95,6 @@ function fixMojibake(str) {
   }
 }
 
-// Reconstruye el árbol real a partir del payload de hidratación de React Router.
-// Copiado tal cual de la extensión original.
 function hydrate(rootIndex, table) {
   const seen = new Map();
   function resolve(value) {
@@ -100,7 +105,7 @@ function hydrate(rootIndex, table) {
         try {
           return JSON.parse(s);
         } catch (e) {
-          // no era JSON, se trata como string normal más abajo
+          // no era JSON
         }
       }
     }
@@ -171,18 +176,12 @@ function mangaFromNode(manga) {
   };
 }
 
-// Busca un objeto que tenga id y title (propiedades de manga) en la respuesta hidratada
 function findMangaInHydrated(hydrated) {
   if (!hydrated) return null;
-  
-  // Si es un objeto con id y title directamente, es el manga
   if (hydrated.id && hydrated.title) {
     return hydrated;
   }
-  
-  // Si es un objeto, buscar en propiedades comunes
   if (typeof hydrated === "object" && !Array.isArray(hydrated)) {
-    // Prioridad: manga > data > content > result
     if (hydrated.manga && hydrated.manga.id && hydrated.manga.title) {
       return hydrated.manga;
     }
@@ -196,18 +195,15 @@ function findMangaInHydrated(hydrated) {
       return hydrated.result;
     }
   }
-  
   return null;
 }
 
-// --- MangaProvider -------------------------------------------------------
+// --- MangaProvider ---
 
 const plugin = {
   id: "mangadot",
   name: "Mangadotnet",
 
-  // offset se traduce a página (1-based) usando PAGE_SIZE como tamaño de página,
-  // igual que hace la extensión original con this.total = 100.
   async popular(offset, tagId) {
     if (tagId) return plugin._byGenre(tagId, offset, "tracked");
 
@@ -217,7 +213,6 @@ const plugin = {
     );
     if (!json) return [];
 
-    // 7 = {manga_list, pagination} — índice confirmado en el código fuente original.
     const hydrated = hydrate(7, json);
     if (!hydrated || !hydrated.manga_list) return [];
 
@@ -238,7 +233,6 @@ const plugin = {
     const json = await fetchJson(`${BASE_URL}/search.data?${buildParams(params)}`);
     if (!json) return [];
 
-    // 4 = {allGenres,displayMode,filters,page,pagination,query,results}
     const hydrated = hydrate(4, json);
     if (!hydrated || !hydrated.results) return [];
 
@@ -269,32 +263,39 @@ const plugin = {
 
   async detail(id) {
     const url = `${BASE_URL}/manga/${encodeURIComponent(id)}.data?_routes=pages/MangaDetailPage`;
-    const json = await fetchJson(url);
+    let json = await fetchJson(url);
+    
+    // Si .data falla, intentar parsear HTML de la página normal
+    if (!json) {
+      harbor.log("→ Intentando parsear HTML de página normal...");
+      const htmlUrl = `${BASE_URL}/manga/${encodeURIComponent(id)}`;
+      const html = await fetchHtml(htmlUrl);
+      if (html) {
+        json = extractHydrationPayload(html);
+      }
+    }
+
     if (!json) return null;
 
-    // Intentar múltiples índices para encontrar el manga
-    // (el sitio puede haber cambiado su estructura de hidrataci��n)
     let mangaNode = null;
-    const tableCopy = json.slice ? Array.from(json) : json; // asegurar que es array
+    const tableCopy = Array.isArray(json) ? json : [];
     
-    // Probar de mayor a menor para encontrar el manga
     for (let idx = 20; idx >= 0; idx--) {
       try {
         const attempt = hydrate(idx, tableCopy);
         const found = findMangaInHydrated(attempt);
         if (found) {
           mangaNode = found;
-          harbor.log(`mangadot: detail() encontró manga en índice ${idx}`);
+          harbor.log(`✓ Manga encontrado en índice ${idx}`);
           break;
         }
       } catch (e) {
-        // ignorar errores de hydrate en índices inválidos
         continue;
       }
     }
 
     if (!mangaNode) {
-      harbor.log("mangadot: detail() no encontró manga válido");
+      harbor.log("❌ No se encontró manga válido");
       return null;
     }
 
@@ -304,25 +305,51 @@ const plugin = {
     return base;
   },
 
-  // El endpoint ya devuelve el array completo y ordenado por fecha (no hay
-  // paginación en la extensión original: hace una sola petición y ya está).
   async chapters(id) {
-    const json = await fetchJson(`${API_URL}/manga/${encodeURIComponent(id)}/chapters/list`);
+    // Intentar API directo primero
+    const url = `${API_URL}/manga/${encodeURIComponent(id)}/chapters/list`;
+    harbor.log(`→ Solicitando capítulos desde ${url}`);
+    
+    let json = await fetchJson(url);
+    
+    // Si falla, parsear HTML de la página del manga
     if (!json) {
-      harbor.log("mangadot: chapters() recibió null o error en", id);
+      harbor.log("→ API falló, intentando parsear HTML...");
+      const htmlUrl = `${BASE_URL}/manga/${encodeURIComponent(id)}`;
+      const html = await fetchHtml(htmlUrl);
+      if (html) {
+        json = extractHydrationPayload(html);
+        if (json) {
+          // Buscar chapters en el payload hidratado
+          const table = Array.isArray(json) ? json : [];
+          for (let idx = 0; idx < Math.min(20, table.length); idx++) {
+            const attempt = hydrate(idx, table);
+            if (attempt && Array.isArray(attempt.chapters)) {
+              json = { data: attempt.chapters };
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    if (!json) {
+      harbor.log("❌ Capítulos: no se obtuvieron datos");
       return [];
     }
 
-    // Manejar múltiples formatos de respuesta posibles
     let chaptersData = [];
     if (Array.isArray(json)) {
       chaptersData = json;
+      harbor.log(`✓ Array directo: ${json.length} capítulos`);
     } else if (json.data && Array.isArray(json.data)) {
       chaptersData = json.data;
+      harbor.log(`✓ json.data: ${json.data.length} capítulos`);
     } else if (json.chapters && Array.isArray(json.chapters)) {
       chaptersData = json.chapters;
+      harbor.log(`✓ json.chapters: ${json.chapters.length} capítulos`);
     } else {
-      harbor.log("mangadot: chapters() recibió formato inesperado:", typeof json, Object.keys(json || {}));
+      harbor.log(`❌ Formato inesperado: ${Object.keys(json || {}).slice(0, 5)}`);
       return [];
     }
 
@@ -330,7 +357,6 @@ const plugin = {
       .map((c) => {
         if (c == null || c.id == null) return null;
 
-        // Parsear número de capítulo de varias formas posibles
         let chapNum = "0";
         if (c.chapter_number != null) {
           chapNum = String(c.chapter_number);
@@ -340,10 +366,8 @@ const plugin = {
           chapNum = String(c.chapterNumber);
         }
 
-        // Detectar si es carga del usuario (tiene grupo de scanlación)
         const hasGroup = c.group_name || c.scanlator_group || c.translator_group || c.group;
 
-        // Construir título
         let title = `Chapter ${chapNum}`;
         if (c.chapter_title && String(c.chapter_title).length) {
           title = fixMojibake(c.chapter_title);
@@ -355,9 +379,6 @@ const plugin = {
         }
 
         return {
-          // El sufijo "?source=user" indica que las páginas viven bajo /api/uploads/
-          // en vez de /api/chapters/ — lo codificamos en el propio id para que
-          // pageUrls() sepa qué endpoint usar sin peticiones extra.
           id: hasGroup ? `${c.id}?source=user` : String(c.id),
           chapter: chapNum,
           title,
@@ -370,7 +391,7 @@ const plugin = {
       .filter(Boolean);
 
     chapters.sort((a, b) => parseFloat(a.chapter) - parseFloat(b.chapter));
-    harbor.log(`mangadot: chapters() retornando ${chapters.length} capítulos para manga ${id}`);
+    harbor.log(`✓ Retornando ${chapters.length} capítulos`);
     return chapters;
   },
 
@@ -381,48 +402,57 @@ const plugin = {
       ? `${API_URL}/uploads/${encodeURIComponent(rawId)}/images`
       : `${API_URL}/chapters/${encodeURIComponent(rawId)}/images`;
 
-    harbor.log(`mangadot: pageUrls() pidiendo ${endpoint}`);
-    const json = await fetchJson(endpoint);
+    harbor.log(`→ Solicitando imágenes desde ${endpoint}`);
+    let json = await fetchJson(endpoint);
+
+    // Si falla, parsear HTML del capítulo
+    if (!json) {
+      harbor.log("→ API falló, intentando parsear HTML del capítulo...");
+      const htmlUrl = `${BASE_URL}/chapter/${encodeURIComponent(chapterId.split("?")[0])}`;
+      const html = await fetchHtml(htmlUrl);
+      if (html) {
+        json = extractHydrationPayload(html);
+        if (json) {
+          const table = Array.isArray(json) ? json : [];
+          for (let idx = 0; idx < Math.min(20, table.length); idx++) {
+            const attempt = hydrate(idx, table);
+            if (attempt && Array.isArray(attempt.images)) {
+              json = { images: attempt.images };
+              break;
+            } else if (attempt && Array.isArray(attempt.pages)) {
+              json = { images: attempt.pages };
+              break;
+            }
+          }
+        }
+      }
+    }
 
     if (!json) {
-      harbor.log("mangadot: pageUrls() recibió null en", endpoint);
+      harbor.log("❌ Imágenes: no se obtuvieron datos");
       return [];
     }
 
     let images = [];
-
-    // Intentar múltiples formatos de respuesta
     if (Array.isArray(json)) {
-      // Formato: array directo de strings o objetos
       images = json;
+      harbor.log(`✓ Array directo: ${json.length} imágenes`);
     } else if (json.images && Array.isArray(json.images)) {
-      // Formato: {images: [...]}
       images = json.images;
+      harbor.log(`✓ json.images: ${json.images.length} imágenes`);
     } else if (json.data && Array.isArray(json.data)) {
-      // Formato: {data: [...]} o {data: {images: [...]}}
-      if (json.data.length > 0 && typeof json.data[0] === "object" && json.data[0].images) {
-        images = json.data[0].images;
-      } else {
-        images = json.data;
-      }
+      images = json.data;
+      harbor.log(`✓ json.data: ${json.data.length} imágenes`);
     } else if (json.pages && Array.isArray(json.pages)) {
-      // Formato: {pages: [...]}
       images = json.pages;
-    } else if (json.content && Array.isArray(json.content)) {
-      // Formato: {content: [...]}
-      images = json.content;
+      harbor.log(`✓ json.pages: ${json.pages.length} imágenes`);
     } else {
-      harbor.log("mangadot: pageUrls() recibió formato inesperado:", typeof json, Object.keys(json || {}));
+      harbor.log(`❌ Formato inesperado: ${Object.keys(json || {}).slice(0, 5)}`);
       return [];
     }
 
     const result = images
       .map((img) => {
-        // Soportar múltiples formatos de item:
-        // - string directo: "url"
-        // - objeto con url: {url: "...", ...}
-        // - objeto con image: {image: "...", ...}
-        // - objeto con src: {src: "...", ...}
         let url = null;
         if (typeof img === "string") {
           url = img;
@@ -433,14 +463,10 @@ const plugin = {
       })
       .filter(Boolean);
 
-    harbor.log(`mangadot: pageUrls() retornando ${result.length} imágenes para capítulo ${chapterId}`);
+    harbor.log(`✓ Retornando ${result.length} URLs válidas`);
     return result;
   },
 
-  // Lista de géneros confirmada del getFilterList() original (GenreFilter).
-  // El sitio trae duplicados con distinta capitalización (p.ej. "action"/"Action")
-  // como valores de filtro independientes — se preservan tal cual, ya que son
-  // valores de query reales y no un error de scraping.
   async tags() {
     const GENRES = [
       "Academy", "Acting", "action", "Action", "Adeventure", "adult", "Adult",
