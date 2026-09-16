@@ -1,6 +1,6 @@
 // mangadot.net — Harbor MangaProvider plugin
 //
-// ATENCIÓN: El sitio usa React Router v7 con hidratación SSR. 
+// ATENCIÓN: El sitio usa React Router v7 con hidratación SSR.
 // Los endpoints `/api/` pueden no devolver JSON debido a Cloudflare.
 // Alternativa: parsear el HTML de las páginas y extraer datos del React hydration payload.
 
@@ -72,7 +72,7 @@ function extractHydrationPayload(html) {
     harbor.log("✓ Hydration payload extraído del HTML");
     return payload;
   } catch (e) {
-    harbor.log("❌ No se pudo parsear hydration payload:", String(e).slice(0, 100));
+    harbor.log(`❌ No se pudo parsear hydration payload: ${String(e).slice(0, 100)}`);
     return null;
   }
 }
@@ -95,8 +95,12 @@ function fixMojibake(str) {
   }
 }
 
+// Deshace el formato de "referencia por índice" que usa React Router para
+// serializar el árbol de datos del servidor (evita duplicados repitiendo objetos
+// ya vistos como un índice numérico dentro de la tabla plana `table`).
 function hydrate(rootIndex, table) {
   const seen = new Map();
+
   function resolve(value) {
     if (value === -5) return null;
     if (typeof value === "number" && typeof table[value] === "string") {
@@ -105,7 +109,7 @@ function hydrate(rootIndex, table) {
         try {
           return JSON.parse(s);
         } catch (e) {
-          // no era JSON
+          // no era JSON, se trata como string normal más abajo
         }
       }
     }
@@ -114,6 +118,7 @@ function hydrate(rootIndex, table) {
     }
     return walk(value);
   }
+
   function walk(node) {
     if (node == null) return node;
     if (seen.has(node)) return seen.get(node);
@@ -135,7 +140,38 @@ function hydrate(rootIndex, table) {
     }
     return node;
   }
+
   return resolve(rootIndex);
+}
+
+// El índice raíz que contiene "manga_list" / "results" dentro de la tabla de
+// hidratación NO es fijo: cambia según cuántos loaders/metadatos trae la
+// respuesta. Por eso escaneamos varios índices en vez de asumir uno solo
+// (esto es lo que ya hacía detail()/chapters(), aquí se generaliza).
+function scanForArrayKey(table, keys) {
+  if (!Array.isArray(table)) return null;
+  const maxIdx = Math.min(table.length, 40);
+
+  for (let idx = 0; idx < maxIdx; idx++) {
+    let attempt;
+    try {
+      attempt = hydrate(idx, table);
+    } catch (e) {
+      continue;
+    }
+    if (attempt && typeof attempt === "object" && !Array.isArray(attempt)) {
+      for (const key of keys) {
+        const val = attempt[key];
+        if (Array.isArray(val) && val.length) {
+          harbor.log(`✓ Encontrado "${key}" en índice ${idx} (${val.length} items)`);
+          return val;
+        }
+      }
+    }
+  }
+
+  harbor.log(`❌ No se encontró ninguna de las keys [${keys.join(", ")}] en el payload`);
+  return null;
 }
 
 function buildParams(params) {
@@ -213,10 +249,10 @@ const plugin = {
     );
     if (!json) return [];
 
-    const hydrated = hydrate(7, json);
-    if (!hydrated || !hydrated.manga_list) return [];
+    const list = scanForArrayKey(json, ["manga_list", "results"]);
+    if (!list) return [];
 
-    return hydrated.manga_list.map(mangaFromNode);
+    return list.map(mangaFromNode);
   },
 
   async _byGenre(tagId, offset, sortBy) {
@@ -233,10 +269,10 @@ const plugin = {
     const json = await fetchJson(`${BASE_URL}/search.data?${buildParams(params)}`);
     if (!json) return [];
 
-    const hydrated = hydrate(4, json);
-    if (!hydrated || !hydrated.results) return [];
+    const list = scanForArrayKey(json, ["results", "manga_list"]);
+    if (!list) return [];
 
-    return hydrated.results.map(mangaFromNode);
+    return list.map(mangaFromNode);
   },
 
   async search(query, offset, tagId) {
@@ -255,16 +291,16 @@ const plugin = {
     const json = await fetchJson(`${BASE_URL}/search.data?${buildParams(params)}`);
     if (!json) return [];
 
-    const hydrated = hydrate(4, json);
-    if (!hydrated || !hydrated.results) return [];
+    const list = scanForArrayKey(json, ["results", "manga_list"]);
+    if (!list) return [];
 
-    return hydrated.results.map(mangaFromNode);
+    return list.map(mangaFromNode);
   },
 
   async detail(id) {
     const url = `${BASE_URL}/manga/${encodeURIComponent(id)}.data?_routes=pages/MangaDetailPage`;
     let json = await fetchJson(url);
-    
+
     // Si .data falla, intentar parsear HTML de la página normal
     if (!json) {
       harbor.log("→ Intentando parsear HTML de página normal...");
@@ -279,8 +315,8 @@ const plugin = {
 
     let mangaNode = null;
     const tableCopy = Array.isArray(json) ? json : [];
-    
-    for (let idx = 20; idx >= 0; idx--) {
+
+    for (let idx = Math.min(tableCopy.length, 40) - 1; idx >= 0; idx--) {
       try {
         const attempt = hydrate(idx, tableCopy);
         const found = findMangaInHydrated(attempt);
@@ -309,9 +345,9 @@ const plugin = {
     // Intentar API directo primero
     const url = `${API_URL}/manga/${encodeURIComponent(id)}/chapters/list`;
     harbor.log(`→ Solicitando capítulos desde ${url}`);
-    
+
     let json = await fetchJson(url);
-    
+
     // Si falla, parsear HTML de la página del manga
     if (!json) {
       harbor.log("→ API falló, intentando parsear HTML...");
@@ -322,8 +358,13 @@ const plugin = {
         if (json) {
           // Buscar chapters en el payload hidratado
           const table = Array.isArray(json) ? json : [];
-          for (let idx = 0; idx < Math.min(20, table.length); idx++) {
-            const attempt = hydrate(idx, table);
+          for (let idx = 0; idx < Math.min(40, table.length); idx++) {
+            let attempt;
+            try {
+              attempt = hydrate(idx, table);
+            } catch (e) {
+              continue;
+            }
             if (attempt && Array.isArray(attempt.chapters)) {
               json = { data: attempt.chapters };
               break;
@@ -414,8 +455,13 @@ const plugin = {
         json = extractHydrationPayload(html);
         if (json) {
           const table = Array.isArray(json) ? json : [];
-          for (let idx = 0; idx < Math.min(20, table.length); idx++) {
-            const attempt = hydrate(idx, table);
+          for (let idx = 0; idx < Math.min(40, table.length); idx++) {
+            let attempt;
+            try {
+              attempt = hydrate(idx, table);
+            } catch (e) {
+              continue;
+            }
             if (attempt && Array.isArray(attempt.images)) {
               json = { images: attempt.images };
               break;
