@@ -13,50 +13,61 @@
 //     toda la sección Tendencias. Ahora se agrupan TODOS los <a> que
 //     apuntan al mismo slug y se combina lo que aporta cada uno (portada
 //     de uno, título de otro), cubriendo (a) y (b) a la vez.
-//   - tags(): CORREGIDO. Antes dependía de harbor.parseHtml(...)
-//     .querySelectorAll(...), una API que el plugin hermano (mangalect,
-//     que sí funciona bien) nunca usa — no hay garantía de que exista o
-//     sea fiable en el runtime de Harbor. Los 78 géneros/temáticas están
-//     en enlaces estáticos en la home (?genre=X / ?theme=Y), así que se
-//     capturaron uno a uno contra el HTML real y se hardcodean aquí,
-//     igual que hace mangalect con su lista de géneros.
+//   - tags(): CORREGIDO (simplificado, no por bug). harbor.parseHtml SÍ
+//     es una API real y soportada (confirmado en la doc de Harbor), así
+//     que el tags() original no estaba roto por usarla. Pero los 78
+//     géneros/temáticas son estáticos y ya están confirmados contra el
+//     HTML real, así que hardcodearlos evita un parseo + querySelectorAll
+//     en cada llamada, igual que hace mangalect con su lista de géneros.
+//   - Referer → CORREGIDO (bug real, confirmado en la doc de Harbor):
+//     "These request headers are stripped: host, cookie, authorization,
+//     origin, referer, ...". El header `Referer: BASE_URL` que ponía
+//     fetchText/fetchJson NUNCA llegaba al servidor — era código muerto.
+//     Si leercapitulo.co exige Referer para servir /manga/, /manga/{id}/
+//     o /leer/.../N/, eso solo explicaría el 404 que vi al probar esas
+//     rutas. Lo único que Harbor sí deja fijar es `user-agent`, así que
+//     se cambió el header por uno de navegador real — es la única
+//     palanca real disponible para parecer tráfico legítimo.
 //
-// ⚠️ SIN CONFIRMAR / BLOQUEADO — necesita captura real de tu parte:
-//   Al intentar traer HTML real de /manga/ (catálogo), /manga/{id}/
-//   (ficha) y /leer/{id}/{slug}/{n}/ (capítulo) con una petición simple
-//   (sin sesión de navegador), el sitio devolvió 404 en los tres casos,
-//   mientras que "/" sí respondió bien. Eso es el patrón típico de una
-//   protección anti-bot/WAF que sólo deja pasar tráfico que parece un
-//   navegador real (cookies de challenge, TLS fingerprint, etc.).
+// ✅ CONFIRMADO contra HTML real de ficha (/manga/byywymjdxc/u-dont-know-me/):
+//   - detail(): portada (<div class="lc-cover-lg"><img src=...>), sinopsis
+//     (<section id="sinopsis">...<p>), estado (<span class="k">Estado</span>
+//     <a>Completed</a> — en inglés, y el valor va dentro de un <a>, no como
+//     texto plano), autor (<span class="k">Autor</span><span>X</span>) y
+//     títulos alternativos (<p class="small lc-muted mb-2"> separados por
+//     "·"). Las cuatro primeras estaban rotas en el código original
+//     (regex buscando marcado que no existe) — quedan corregidas abajo.
+//   - chapters(): cada fila es <a class="lc-chapter-row" href="/leer/.../N/">
+//     <span class="n">Capitulo N</span><span class="d">FECHA</span></a>.
+//     No hay paginación visible (ni "?before=", ni botón "cargar más"; el
+//     filtro/orden de la ficha sólo reordenan el DOM ya presente) — pero
+//     la ficha de ejemplo sólo tenía 1 capítulo, así que esto no está
+//     100% confirmado para mangas largos (ej. One Piece, 1194 capítulos).
 //
-//   Esto es MUY probablemente la causa principal de que el plugin "no
-//   funcione muy bien": detail(), chapters() y pageUrls() dependen todos
-//   de esas rutas. No pude verificar contra HTML real:
-//     - la estructura de la ficha (h1, portada, sinopsis, estado, lista
-//       de capítulos) que usa detail()/chapters()
-//     - si la lista de capítulos de la ficha pagina (como sí le pasaba a
-//       mangalect, que necesitó seguir un enlace "?before=" para no
-//       cortar mangas largos) — leercapitulo, tal cual está, NO sigue
-//       ninguna paginación, así que si el sitio pagina igual, esto se
-//       queda corto en mangas largos.
+// ⚠️ SIN CONFIRMAR / BLOQUEADO — sigue pendiente:
+//     - si la lista de capítulos pagina en mangas largos (sólo se vio
+//       una ficha con 1 capítulo; ver nota de chapters() más abajo)
 //     - si pageUrls() realmente necesita el fallback cifrado
 //       (array_data) o si el scan de <img> normal ya es suficiente / al
 //       revés (que el scan de <img> esté devolviendo miniaturas de
 //       "relacionados" en vez de las páginas reales, colándose antes de
 //       llegar al fallback correcto).
 //
-//   Para arreglar esas tres cosas con la misma confianza que mangalect
-//   necesito que me pegues el HTML real (o una captura de red) de:
-//     1. una ficha, p.ej. /manga/psvkfbmjgo/one-piece/
-//     2. un capítulo, p.ej. /leer/psvkfbmjgo/one-piece/1194/
-//   Puedes sacarlo con "Ver código fuente" / DevTools → Network → Copy
-//   response, igual que se hizo para armar el plugin de mangalect.
-//   Mientras tanto dejé detail()/chapters()/pageUrls() con la misma
-//   lógica original (ligeramente reforzada) para no romper nada que
-//   pudiera estar funcionando parcialmente.
+//   Para cerrar lo que queda pendiente sólo necesito el HTML real (o una
+//   captura de red) de un capítulo, p.ej.
+//   /leer/psvkfbmjgo/one-piece/1194/ (Ver código fuente / DevTools →
+//   Network → Copy response), y si puedes, la ficha de un manga LARGO
+//   (ej. /manga/psvkfbmjgo/one-piece/, 1194 capítulos) para descartar
+//   paginación del todo.
 
 const BASE_URL = "https://www.leercapitulo.co";
 const PAGE_SIZE = 48;
+// Referer se elimina siempre en harbor.http (confirmado en la doc de la
+// API); user-agent es el único header "de navegador" que Harbor deja
+// fijar, así que es lo único real que podemos usar para intentar pasar
+// una protección anti-bot basada en cabeceras.
+const DESKTOP_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
 
 // ============================================================
 // Helpers
@@ -70,7 +81,9 @@ async function fetchText(path) {
 
     const res = await harbor.http(url, {
       responseType: "text",
-      headers: { Referer: `${BASE_URL}/` },
+      // Referer se elimina siempre en harbor.http (ver doc de la API);
+      // user-agent es lo único real que podemos fijar.
+      headers: { "user-agent": DESKTOP_UA },
     });
 
     if (!res || !res.ok) {
@@ -91,7 +104,7 @@ async function fetchJson(url) {
     // (o null si no es JSON válido), a diferencia de "text".
     const json = await harbor.http(url, {
       responseType: "json",
-      headers: { Referer: `${BASE_URL}/` },
+      headers: { "user-agent": DESKTOP_UA },
     });
 
     if (json === null) {
@@ -374,8 +387,22 @@ const plugin = {
     return results;
   },
 
-  // ⚠️ Sin confirmar contra HTML real de ficha (ver notas de cabecera).
-  // Lógica intacta respecto al original.
+  // CORREGIDO contra HTML real de ficha (/manga/byywymjdxc/u-dont-know-me/):
+  //   - cover: el <img> no tiene class="cover"/"manga", vive dentro de
+  //     <div class="lc-cover-lg">. La regex anterior nunca lo encontraba.
+  //   - description: no hay id="example2" ni class="description"; vive en
+  //     <section id="sinopsis"><div><p class="mb-0 lc-muted">. La regex
+  //     anterior tampoco lo encontraba nunca. Se filtra además el texto
+  //     placeholder "Esta serie todavia no tiene sinopsis." → undefined.
+  //   - status: el valor no es texto plano tras </span>, va dentro de un
+  //     <a>: <span class="k">Estado</span><a href="...">Completed</a>.
+  //     La regex anterior exigía [^<]+ justo tras </span> y fallaba
+  //     siempre. Además el valor viene en INGLÉS ("Completed"/"Ongoing"),
+  //     no en español.
+  //   - author: nuevo. Existe <span class="k">Autor</span><span>X</span>
+  //     en la ficha y antes no se leía nunca.
+  //   - altTitle: nuevo. Existe un <p class="small lc-muted mb-2"> justo
+  //     bajo el <h1> con los títulos alternativos separados por "·".
   async detail(id) {
     if (!id) return null;
 
@@ -391,21 +418,36 @@ const plugin = {
     const titleMatch = html.match(/<h1[^>]*>([^<]+)<\/h1>/i);
     const title = titleMatch ? cleanText(titleMatch[1]) : id;
 
-    const coverMatch = html.match(/<img[^>]*(?:src|data-src|data-lazy-src)=["']([^"']+)["'][^>]*class=["'][^"']*(?:cover|manga)[^"']*["']/i) ||
-                        html.match(/<img[^>]*class=["'][^"']*(?:cover|manga)[^"']*["'][^>]*(?:src|data-src|data-lazy-src)=["']([^"']+)["']/i);
+    const altMatch = html.match(/<p class="small lc-muted mb-2">([\s\S]*?)<\/p>/i);
+    let altTitle;
+    if (altMatch) {
+      const parts = cleanText(altMatch[1])
+        .split("·")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (parts.length) altTitle = parts.join(", ");
+    }
+
+    const coverMatch = html.match(/<div class="lc-cover-lg">[\s\S]*?<img[^>]+src=["']([^"']+)["']/i);
     const cover = absoluteUrl(coverMatch?.[1]);
 
-    const descMatch = html.match(/<p[^>]*id=["']example2["'][^>]*>([\s\S]*?)<\/p>/i) ||
-                      html.match(/<p[^>]*class=["'][^"']*description[^"']*["'][^>]*>([\s\S]*?)<\/p>/i);
-    const description = descMatch ? cleanText(descMatch[1]) : undefined;
+    const synopsisMatch = html.match(/id=["']sinopsis["'][\s\S]*?<p[^>]*>([\s\S]*?)<\/p>/i);
+    let description;
+    if (synopsisMatch) {
+      const text = cleanText(synopsisMatch[1]);
+      if (text && !text.toLowerCase().includes("no tiene sinopsis")) description = text;
+    }
 
-    const statusMatch = html.match(/Estado\s*:\s*<\/span>\s*([^<]+)/i);
+    const statusBlockMatch = html.match(/<span class="k">Estado<\/span>([\s\S]*?)<\/li>/i);
     let status;
-    if (statusMatch) {
-      const statusRaw = cleanText(statusMatch[1]).toLowerCase();
-      if (statusRaw.includes("curso")) status = "ongoing";
+    if (statusBlockMatch) {
+      const statusRaw = cleanText(statusBlockMatch[1]).toLowerCase();
+      if (statusRaw.includes("curso") || statusRaw.includes("ongoing")) status = "ongoing";
       else if (statusRaw.includes("complet") || statusRaw.includes("finaliz")) status = "completed";
     }
+
+    const authorMatch = html.match(/<span class="k">Autor<\/span>([\s\S]*?)<\/li>/i);
+    const author = authorMatch ? cleanText(authorMatch[1]) || undefined : undefined;
 
     const chapters = await plugin.chapters(id, html);
     const lastChapter = chapters.length > 0 ? chapters[chapters.length - 1].chapter : undefined;
@@ -413,10 +455,12 @@ const plugin = {
     const result = {
       id,
       title,
+      altTitle,
       cover,
       description,
       status,
       lastChapter,
+      author,
     };
 
     summaryCache.set(id, {
@@ -428,32 +472,44 @@ const plugin = {
     return result;
   },
 
-  // ⚠️ Sin confirmar si la ficha pagina la lista de capítulos (como sí
-  // le pasaba a mangalect). Si pagina y no lo seguimos, mangas largos se
-  // quedarán cortos — exactamente el bug que se corrigió en mangalect.
+  // CORREGIDO/mejorado contra HTML real de ficha: cada fila es
+  // <a class="lc-chapter-row" href="/leer/.../N/">
+  //   <span class="n">Capitulo N</span><span class="d">FECHA</span>
+  // </a>
+  // La regex original ya funcionaba por casualidad (span está entre los
+  // tags permitidos), pero tiraba la fecha a la basura. Ahora se extrae
+  // el bloque interno completo del <a> y se leen los spans "n"/"d" por
+  // separado (agnóstico al orden de atributos), rellenando publishAt.
+  //
+  // ⚠️ No vi paginación en la ficha de ejemplo (no hay "?before=" ni
+  // botón "cargar más"; el filtro/orden son botones que sólo reordenan
+  // el DOM ya presente) — pero esa ficha sólo tiene 1 capítulo. Si algún
+  // manga largo (ej. One Piece) sí pagina la lista, esto se quedará
+  // corto igual que le pasaba a mangalect antes de su fix.
   async chapters(id, cachedHtml) {
     let html = cachedHtml || (await fetchText(`/manga/${id}/`));
 
     if (!html) return [];
 
-    const chapterRe = /<a[^>]+href=["']([^"']*\/leer\/[^"']*)["'][^>]*>[\s\S]*?(?:<(?:h[34]|span|strong|b)[^>]*>([^<]+)<\/(?:h[34]|span|strong|b)>|([^<]+))<\/a>/gi;
+    const anchorRe = /<a[^>]+href=["']([^"']*\/leer\/[^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi;
 
     const chapters = [];
     const seen = new Set();
     let m;
 
-    while ((m = chapterRe.exec(html)) !== null) {
+    while ((m = anchorRe.exec(html)) !== null) {
       const href = m[1];
+      const inner = m[2];
       const chId = absoluteUrl(href);
 
       if (!chId || seen.has(chId)) continue;
-
       seen.add(chId);
 
-      const titleText = cleanText(m[2] || m[3] || "");
-      const number = href.split("/").filter(Boolean).pop();
+      const numSpan = inner.match(/<span[^>]*class=["']n["'][^>]*>([^<]*)<\/span>/i);
+      const dateSpan = inner.match(/<span[^>]*class=["']d["'][^>]*>([^<]*)<\/span>/i);
 
-      let title = titleText;
+      const number = href.split("/").filter(Boolean).pop();
+      let title = numSpan ? cleanText(numSpan[1]) : cleanText(inner);
       if (!title && number) title = `Capítulo ${number}`;
       if (!title) title = number || "Sin título";
 
@@ -463,6 +519,7 @@ const plugin = {
         title,
         pages: 0,
         language: "es",
+        publishAt: dateSpan ? cleanText(dateSpan[1]) : undefined,
       });
     }
 
