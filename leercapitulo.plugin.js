@@ -711,254 +711,133 @@ const plugin = {
    * usa regex como fallback.
    * ======================================================= */
 
-  async chapters(id, cachedHtml) {
-    let html = cachedHtml;
+  async chapters(id) {
+  const mangaUrl = mangaUrlFromId(id);
 
-    if (!html) {
-      const mangaUrl = mangaUrlFromId(id);
+  if (!mangaUrl) {
+    return [];
+  }
 
-      if (!mangaUrl) {
-        harbor.log?.(
-          `LeerCapitulo chapters: URL inválida para ${id}`
-        );
+  const html = await fetchText(mangaUrl);
 
-        return [];
-      }
+  if (!html) {
+    return [];
+  }
 
-      harbor.log?.(
-        `LeerCapitulo chapters URL: ${mangaUrl}`
-      );
+  const chapters = [];
+  const seen = new Set();
 
-      html = await fetchText(mangaUrl);
+  /*
+   * LeerCapitulo actualmente genera enlaces como:
+   *
+   * /leer/aq095eld86/sobreviviendo-a-los-barbaros-de-un-juego/162/
+   */
+
+  const re =
+    /<a\b[^>]*href=["']([^"']*\/leer\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+
+  let match;
+
+  while ((match = re.exec(html)) !== null) {
+    const href = match[1];
+    const inner = match[2];
+
+    const chapterUrl = absoluteUrl(href);
+
+    if (!chapterUrl) {
+      continue;
     }
 
-    if (!html) {
-      harbor.log?.(
-        "LeerCapitulo chapters: HTML vacío"
-      );
-
-      return [];
+    if (seen.has(chapterUrl)) {
+      continue;
     }
 
-    const chapters = [];
-    const seen = new Set();
+    seen.add(chapterUrl);
 
-    /* =====================================================
-     * PRIMER INTENTO: DOM
-     * ===================================================== */
+    /*
+     * Número = último segmento de la URL.
+     */
+    const cleanHref = href
+      .split("?")[0]
+      .split("#")[0];
 
-    try {
-      const doc = harbor.parseHtml(html);
+    const parts = cleanHref
+      .split("/")
+      .filter(Boolean);
 
-      if (doc) {
-        const anchors = doc.querySelectorAll(
-          'a.lc-chapter-row[href*="/leer/"], a[href*="/leer/"]'
-        );
+    let chapter = null;
 
-        for (const anchor of anchors) {
-          const href =
-            anchor.getAttribute("href");
+    if (parts.length) {
+      const last = parts[parts.length - 1];
 
-          if (!href) continue;
-
-          if (!href.includes("/leer/")) {
-            continue;
-          }
-
-          const chapterId =
-            absoluteUrl(href);
-
-          if (!chapterId) continue;
-
-          if (seen.has(chapterId)) {
-            continue;
-          }
-
-          seen.add(chapterId);
-
-          let title = "";
-          let chapterNumber = null;
-          let publishAt;
-
-          const numberNode =
-            anchor.querySelector(".n");
-
-          const dateNode =
-            anchor.querySelector(".d");
-
-          if (numberNode) {
-            title = cleanText(
-              numberNode.textContent
-            );
-          }
-
-          if (dateNode) {
-            publishAt = cleanText(
-              dateNode.textContent
-            );
-          }
-
-          const parts = href
-            .split("/")
-            .filter(Boolean);
-
-          const number =
-            parts.length > 0
-              ? parts[parts.length - 1]
-              : null;
-
-          chapterNumber =
-            number || null;
-
-          if (!title && chapterNumber) {
-            title =
-              `Capítulo ${chapterNumber}`;
-          }
-
-          if (!title) {
-            title =
-              cleanText(
-                anchor.textContent
-              );
-          }
-
-          if (!title) {
-            title = "Sin título";
-          }
-
-          chapters.push({
-            id: chapterId,
-            chapter: chapterNumber,
-            title,
-            pages: 0,
-            language: "es",
-            publishAt,
-          });
-        }
-      }
-    } catch (e) {
-      harbor.log?.(
-        `LeerCapitulo DOM chapters error: ${String(e)}`
-      );
-    }
-
-    /* =====================================================
-     * FALLBACK REGEX
-     *
-     * Se ejecuta si el DOM no encontró nada.
-     * ===================================================== */
-
-    if (chapters.length === 0) {
-      const anchorRe =
-        /<a[^>]+href=["']([^"']*\/leer\/[^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi;
-
-      let match;
-
-      while ((match = anchorRe.exec(html)) !== null) {
-        const href = match[1];
-        const inner = match[2];
-
-        const chapterId =
-          absoluteUrl(href);
-
-        if (!chapterId) continue;
-
-        if (seen.has(chapterId)) {
-          continue;
-        }
-
-        seen.add(chapterId);
-
-        const numSpan =
-          inner.match(
-            /<span[^>]*class=["'][^"']*\bn\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/i
-          );
-
-        const dateSpan =
-          inner.match(
-            /<span[^>]*class=["'][^"']*\bd\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/i
-          );
-
-        const parts = href
-          .split("/")
-          .filter(Boolean);
-
-        const number =
-          parts.length > 0
-            ? parts[parts.length - 1]
-            : null;
-
-        let title =
-          numSpan
-            ? cleanText(numSpan[1])
-            : cleanText(inner);
-
-        if (!title && number) {
-          title =
-            `Capítulo ${number}`;
-        }
-
-        if (!title) {
-          title =
-            number || "Sin título";
-        }
-
-        chapters.push({
-          id: chapterId,
-          chapter: number,
-          title,
-          pages: 0,
-          language: "es",
-          publishAt:
-            dateSpan
-              ? cleanText(dateSpan[1])
-              : undefined,
-        });
+      if (/^\d+(?:\.\d+)?$/.test(last)) {
+        chapter = last;
       }
     }
 
-    /* =====================================================
-     * ORDEN
-     *
-     * Harbor espera normalmente los capítulos desde el
-     * primero hasta el último.
-     * ===================================================== */
+    /*
+     * Título.
+     */
+    let title = cleanText(inner);
 
-    chapters.sort((a, b) => {
-      const na = parseFloat(
-        String(a.chapter ?? "").replace(",", ".")
-      );
-
-      const nb = parseFloat(
-        String(b.chapter ?? "").replace(",", ".")
-      );
-
-      if (
-        Number.isFinite(na) &&
-        Number.isFinite(nb)
-      ) {
-        return na - nb;
-      }
-
-      if (Number.isFinite(na)) return -1;
-      if (Number.isFinite(nb)) return 1;
-
-      return String(a.title || "").localeCompare(
-        String(b.title || ""),
-        "es",
-        {
-          numeric: true,
-          sensitivity: "base",
-        }
-      );
-    });
-
-    harbor.log?.(
-      `LeerCapitulo: total capítulos = ${chapters.length}`
+    const numberMatch = title.match(
+      /Cap[ií]tulo\s+([0-9]+(?:\.[0-9]+)?)/i
     );
 
-    return chapters;
-  },
+    if (numberMatch) {
+      chapter = numberMatch[1];
+    }
+
+    if (!title) {
+      title = chapter
+        ? `Capítulo ${chapter}`
+        : "Sin título";
+    }
+
+    /*
+     * Fecha.
+     */
+    const dateMatch = inner.match(
+      /<span[^>]*class=["'][^"']*\bd\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/i
+    );
+
+    const publishAt = dateMatch
+      ? cleanText(dateMatch[1])
+      : undefined;
+
+    chapters.push({
+      id: chapterUrl,
+      chapter,
+      title,
+      pages: 1,
+      language: "es",
+      publishAt,
+    });
+  }
+
+  /*
+   * Orden ascendente.
+   */
+  chapters.sort((a, b) => {
+    const na = parseFloat(a.chapter);
+    const nb = parseFloat(b.chapter);
+
+    if (Number.isFinite(na) && Number.isFinite(nb)) {
+      return na - nb;
+    }
+
+    return String(a.title).localeCompare(
+      String(b.title),
+      "es",
+      {
+        numeric: true,
+        sensitivity: "base",
+      }
+    );
+  });
+
+  return chapters;
+}
 
   /* =======================================================
    * PAGE URLS
