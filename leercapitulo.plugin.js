@@ -1,5 +1,6 @@
 const BASE_URL = "https://www.leercapitulo.co";
 const PAGE_SIZE = 48;
+const CACHE_TTL = 1000 * 60 * 60; // 1 hora
 
 // ============================================================
 // Helpers
@@ -13,6 +14,7 @@ async function fetchText(path) {
 
     const res = await harbor.http(url, {
       responseType: "text",
+      timeoutMs: 15000, // Timeout más agresivo
     });
 
     if (!res || !res.ok) {
@@ -35,6 +37,7 @@ async function fetchJson(path) {
 
     return await harbor.http(url, {
       responseType: "json",
+      timeoutMs: 15000,
     });
   } catch (e) {
     harbor.log(`LeerCapitulo fetchJson error: ${e}`);
@@ -117,10 +120,40 @@ function normalizeId(id) {
 }
 
 // ============================================================
-// Caché temporal
+// Caché mejorado con expiración
 // ============================================================
 
-const summaryCache = new Map();
+class ExpiringCache {
+  constructor(ttl = CACHE_TTL) {
+    this.cache = new Map();
+    this.ttl = ttl;
+  }
+
+  set(key, value) {
+    this.cache.set(key, {
+      value,
+      expiredAt: Date.now() + this.ttl,
+    });
+  }
+
+  get(key) {
+    const entry = this.cache.get(key);
+    if (!entry) return null;
+
+    if (Date.now() > entry.expiredAt) {
+      this.cache.delete(key);
+      return null;
+    }
+
+    return entry.value;
+  }
+
+  clear() {
+    this.cache.clear();
+  }
+}
+
+const summaryCache = new ExpiringCache();
 
 // ============================================================
 // Array data
@@ -214,23 +247,20 @@ function decodeArrayData(arrayData) {
 }
 
 // ============================================================
-// Parseo de tarjetas
+// Parseo de tarjetas (optimizado)
 // ============================================================
 
 function parseHotMangaBlocks(html) {
   if (!html) return [];
 
   const results = [];
-
   const regex =
     /<[^>]*class=["'][^"']*hot-manga[^"']*["'][^>]*>[\s\S]*?<\/(?:div|article|li)>/gi;
 
   const blocks = html.match(regex) || [];
 
   for (const block of blocks) {
-    const hrefMatch = block.match(
-      /href=["']([^"']*\/manga\/[^"']*)["']/i,
-    );
+    const hrefMatch = block.match(/href=["']([^"']*\/manga\/[^"']*)["']/i);
 
     if (!hrefMatch) continue;
 
@@ -263,16 +293,13 @@ function parseMainpageMangaBlocks(html) {
   if (!html) return [];
 
   const results = [];
-
   const regex =
     /<[^>]*class=["'][^"']*(?:media-left|cover-manga)[^"']*["'][^>]*>[\s\S]*?<\/(?:div|article|li)>/gi;
 
   const blocks = html.match(regex) || [];
 
   for (const block of blocks) {
-    const hrefMatch = block.match(
-      /href=["']([^"']*\/manga\/[^"']*)["']/i,
-    );
+    const hrefMatch = block.match(/href=["']([^"']*\/manga\/[^"']*)["']/i);
 
     if (!hrefMatch) continue;
 
@@ -316,7 +343,6 @@ async function parseCatalogCardsGeneric(html) {
   if (!doc) return [];
 
   const anchors = doc.querySelectorAll('a[href*="/manga/"]');
-
   const results = [];
   const seen = new Set();
 
@@ -330,7 +356,6 @@ async function parseCatalogCardsGeneric(html) {
     if (!slug || seen.has(slug)) continue;
 
     let title = cleanText(a.text());
-
     let cover;
 
     try {
@@ -345,8 +370,6 @@ async function parseCatalogCardsGeneric(html) {
       }
     } catch {}
 
-    // Buscar una imagen dentro del contenedor padre si el <a>
-    // no contiene directamente la imagen.
     if (!cover) {
       try {
         const parent = a.parent();
@@ -442,7 +465,7 @@ function catalogPath({ tagId, page } = {}) {
 }
 
 // ============================================================
-// Detail
+// Detail (Optimizado)
 // ============================================================
 
 function extractMeta(html, property) {
@@ -474,7 +497,6 @@ function extractFirstImage(html) {
     }
   }
 
-  // OpenGraph suele ser una fuente bastante fiable.
   const ogImage =
     extractMeta(html, "og:image") ||
     extractMeta(html, "twitter:image");
@@ -483,7 +505,6 @@ function extractFirstImage(html) {
     return absoluteUrl(ogImage);
   }
 
-  // Último recurso: buscar imágenes que no parezcan iconos/logos.
   const images = [
     ...html.matchAll(
       /<img[^>]+(?:src|data-src|data-lazy-src)=["']([^"']+)["'][^>]*>/gi,
@@ -667,7 +688,6 @@ function cleanChapterTitle(text, number) {
     return number ? `Capítulo ${number}` : "";
   }
 
-  // Elimina fechas habituales.
   title = title
     .replace(
       /\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b/g,
@@ -682,7 +702,6 @@ function cleanChapterTitle(text, number) {
       "",
     );
 
-  // Elimina etiquetas típicas de fecha.
   title = title
     .replace(
       /\b(?:publicado|publicada|actualizado|actualizada|fecha)\s*:?\s*/gi,
@@ -691,19 +710,14 @@ function cleanChapterTitle(text, number) {
     .replace(/\s+/g, " ")
     .trim();
 
-  // Si después de eliminar la fecha no queda nada útil,
-  // utilizamos el número real del capítulo.
   if (!title) {
     return number ? `Capítulo ${number}` : "";
   }
 
-  // Si el texto restante es prácticamente solo un número,
-  // convertirlo en nombre de capítulo.
   if (/^#?\s*\d+(?:\.\d+)?$/.test(title)) {
     return `Capítulo ${title.replace(/^#/, "").trim()}`;
   }
 
-  // Si contiene un número de capítulo explícito, mantenerlo.
   if (
     /^cap(?:ítulo|itulo)?\s*\.?\s*\d+/i.test(title) ||
     /^chapter\s+\d+/i.test(title)
@@ -731,8 +745,6 @@ function extractChapterFromAnchor(a) {
 
   let title = "";
 
-  // Primero buscar elementos internos que normalmente contienen
-  // únicamente el nombre del capítulo.
   const selectors = [
     ".chapter-title",
     ".chapter-name",
@@ -808,7 +820,6 @@ async function parseChaptersFromHtml(html) {
       chapters.push(chapter);
     }
 
-    // Buscar paginación.
     const paginationSelectors = [
       'a[href*="before="]',
       'a[href*="page="]',
@@ -846,7 +857,6 @@ async function parseChaptersFromHtml(html) {
     }
   }
 
-  // Fallback regex por si el parser no encuentra los enlaces.
   if (!chapters.length) {
     const matches = [
       ...html.matchAll(
@@ -954,7 +964,6 @@ async function pageUrlsFromImages(html) {
 
     if (urls.length) return urls;
 
-    // Último recurso: todas las imágenes de la página.
     try {
       const images = doc.querySelectorAll("img");
 
@@ -997,9 +1006,6 @@ const plugin = {
       return this._byGenre(tagId, offset);
     }
 
-    // La portada tiene prioridad sobre /manga/.
-    // Esto evita que Harbor termine mostrando el orden
-    // alfabético/catalogado cuando la portada cambia.
     if (offset === 0) {
       const html = await fetchText("/");
 
@@ -1028,25 +1034,19 @@ const plugin = {
       }
     }
 
-    // Para páginas posteriores usamos el catálogo.
-    const page =
-      Math.floor(offset / PAGE_SIZE) + 1;
+    const page = Math.floor(offset / PAGE_SIZE) + 1;
 
-    const html = await fetchText(
-      catalogPath({ page }),
-    );
+    const html = await fetchText(catalogPath({ page }));
 
     if (!html) return [];
 
-    const cards =
-      await parseCatalogCardsGeneric(html);
+    const cards = await parseCatalogCardsGeneric(html);
 
     return cardsToResults(cards);
   },
 
   async _byGenre(tagId, offset) {
-    const page =
-      Math.floor(offset / PAGE_SIZE) + 1;
+    const page = Math.floor(offset / PAGE_SIZE) + 1;
 
     const html = await fetchText(
       catalogPath({
@@ -1057,14 +1057,13 @@ const plugin = {
 
     if (!html) return [];
 
-    const cards =
-      await parseCatalogCardsGeneric(html);
+    const cards = await parseCatalogCardsGeneric(html);
 
     return cardsToResults(cards);
   },
 
   // ----------------------------------------------------------
-  // Search
+  // Search (OPTIMIZADO - paralleliza peticiones)
   // ----------------------------------------------------------
 
   async search(query, offset, tagId) {
@@ -1082,47 +1081,49 @@ const plugin = {
       return [];
     }
 
-    const page = json.slice(
-      offset,
-      offset + PAGE_SIZE,
-    );
-
+    const page = json.slice(offset, offset + PAGE_SIZE);
     const results = [];
 
-    for (const serie of page) {
-      if (!serie) continue;
+    // OPTIMIZACIÓN: Parallelizar peticiones de metadatos con límite de 3 simultáneas
+    const MAX_CONCURRENT = 3;
+    const batchedRequests = [];
 
-      const id = normalizeId(serie.link);
+    for (let i = 0; i < page.length; i += MAX_CONCURRENT) {
+      const batch = page.slice(i, i + MAX_CONCURRENT);
+      const promises = batch.map(async (serie) => {
+        if (!serie) return null;
 
-      if (!id) continue;
+        const id = normalizeId(serie.link);
+        if (!id) return null;
 
-      const result = {
-        id,
-        title:
-          cleanText(serie.label) ||
-          "Untitled",
-        cover: absoluteUrl(
-          serie.thumbnail,
-        ),
-      };
+        const result = {
+          id,
+          title: cleanText(serie.label) || "Untitled",
+          cover: absoluteUrl(serie.thumbnail),
+        };
 
-      // Obtener títulos alternativos cuando hay pocos
-      // resultados, igual que hacía la versión anterior.
-      if (json.length <= 6 && serie.link) {
-        const html = await fetchText(serie.link);
-
-        if (html) {
-          const altTitle = extractAlternateTitles(html);
-
-          if (altTitle) {
-            result.altTitle = altTitle;
+        // OPTIMIZACIÓN: Solo fetch de detalles si hay pocos resultados (< 10)
+        // y solo en batches limitados
+        if (json.length <= 10 && serie.link) {
+          try {
+            const html = await fetchText(serie.link);
+            if (html) {
+              const altTitle = extractAlternateTitles(html);
+              if (altTitle) {
+                result.altTitle = altTitle;
+              }
+            }
+          } catch (e) {
+            harbor.log(`Error fetching alt title for ${serie.link}: ${e}`);
           }
         }
-      }
 
-      summaryCache.set(id, result);
+        summaryCache.set(id, result);
+        return result;
+      });
 
-      results.push(result);
+      const batchResults = await Promise.all(promises);
+      results.push(...batchResults.filter(Boolean));
     }
 
     return results;
@@ -1141,15 +1142,10 @@ const plugin = {
 
     const html = await fetchText(normalizedId);
 
-    // Incluso si la página falla, devolver lo que sabemos
-    // desde search.
     if (!html) {
       if (cached) {
-        return {
-          ...cached,
-        };
+        return { ...cached };
       }
-
       return null;
     }
 
@@ -1159,30 +1155,20 @@ const plugin = {
     );
 
     const cover =
-      extractFirstImage(html) ||
-      cached?.cover;
+      extractFirstImage(html) || cached?.cover;
 
-    const description =
-      extractDescription(html);
-
+    const description = extractDescription(html);
     const altTitle =
-      extractAlternateTitles(html) ||
-      cached?.altTitle;
-
+      extractAlternateTitles(html) || cached?.altTitle;
     const genres = extractGenres(html);
     const status = extractStatus(html);
 
     let chapters = [];
 
     try {
-      chapters = await this.chapters(
-        normalizedId,
-        html,
-      );
+      chapters = await this.chapters(normalizedId, html);
     } catch (e) {
-      harbor.log(
-        `LeerCapitulo detail chapters error: ${e}`,
-      );
+      harbor.log(`LeerCapitulo detail chapters error: ${e}`);
     }
 
     const lastChapter =
@@ -1202,6 +1188,7 @@ const plugin = {
       description,
       status,
       lastChapter,
+      genres: genres && genres.length > 0 ? genres.join(", ") : undefined,
     };
 
     summaryCache.set(normalizedId, {
@@ -1219,9 +1206,7 @@ const plugin = {
   // ----------------------------------------------------------
 
   async chapters(id, cachedHtml) {
-    let html =
-      cachedHtml ||
-      (await fetchText(id));
+    let html = cachedHtml || (await fetchText(id));
 
     if (!html) return [];
 
@@ -1232,8 +1217,6 @@ const plugin = {
     let currentUrl = normalizeId(id);
     let firstPage = true;
 
-    // Procesamos varias páginas si LeerCapitulo usa
-    // paginación para los capítulos.
     for (let iteration = 0; iteration < 50; iteration++) {
       if (!html) break;
 
@@ -1245,8 +1228,7 @@ const plugin = {
         visitedPages.add(currentUrl);
       }
 
-      const parsed =
-        await parseChaptersFromHtml(html);
+      const parsed = await parseChaptersFromHtml(html);
 
       for (const chapter of parsed.chapters) {
         if (!chapter?.id) continue;
@@ -1259,12 +1241,9 @@ const plugin = {
 
       let nextUrl = null;
 
-      // Preferimos enlaces before= porque normalmente significan
-      // capítulos anteriores.
-      const beforeLink =
-        parsed.nextUrls.find((url) =>
-          url.includes("before="),
-        );
+      const beforeLink = parsed.nextUrls.find((url) =>
+        url.includes("before="),
+      );
 
       if (beforeLink) {
         nextUrl = beforeLink;
@@ -1282,7 +1261,6 @@ const plugin = {
       firstPage = false;
     }
 
-    // Orden numérico ascendente.
     allChapters.sort((a, b) => {
       const na = parseFloat(a.chapter);
       const nb = parseFloat(b.chapter);
@@ -1313,42 +1291,32 @@ const plugin = {
 
     if (!html) return [];
 
-    // Primero intentamos las imágenes reales del lector.
-    const imageUrls =
-      await pageUrlsFromImages(html);
+    const imageUrls = await pageUrlsFromImages(html);
 
     if (imageUrls.length) {
       return imageUrls;
     }
 
-    // Fallback antiguo: array_data.
     const arrayDataMatch = html.match(
       /id=["']array_data["'][^>]*>([^<]+)</i,
     );
 
-    const arrayData = (
-      arrayDataMatch?.[1] || ""
-    ).trim();
+    const arrayData = (arrayDataMatch?.[1] || "").trim();
 
-    const urlList =
-      decodeArrayData(arrayData);
+    const urlList = decodeArrayData(arrayData);
 
     if (!urlList.length) {
       return [];
     }
 
-    const orderMetaMatch =
-      html.match(
-        /property=["']ad:check["'][^>]+content=["']([^"']+)["']/i,
-      );
+    const orderMetaMatch = html.match(
+      /property=["']ad:check["'][^>]+content=["']([^"']+)["']/i,
+    );
 
-    const orderRaw =
-      orderMetaMatch?.[1] || null;
+    const orderRaw = orderMetaMatch?.[1] || null;
 
     if (!orderRaw) {
-      return urlList
-        .map(absoluteUrl)
-        .filter(Boolean);
+      return urlList.map(absoluteUrl).filter(Boolean);
     }
 
     const orderList = orderRaw
@@ -1356,8 +1324,7 @@ const plugin = {
       .split("-")
       .filter(Boolean);
 
-    const useReversed =
-      orderList.some((x) => x === "01");
+    const useReversed = orderList.some((x) => x === "01");
 
     const result = orderList
       .map((value) => {
@@ -1365,10 +1332,7 @@ const plugin = {
 
         if (useReversed) {
           index = parseInt(
-            value
-              .split("")
-              .reverse()
-              .join(""),
+            value.split("").reverse().join(""),
             10,
           );
         }
@@ -1413,22 +1377,16 @@ const plugin = {
 
       if (!href || !name) continue;
 
-      const genreMatch =
-        href.match(/[?&]genre=([^&]+)/);
+      const genreMatch = href.match(/[?&]genre=([^&]+)/);
 
-      const themeMatch =
-        href.match(/[?&]theme=([^&]+)/);
+      const themeMatch = href.match(/[?&]theme=([^&]+)/);
 
       let id;
 
       if (genreMatch) {
-        id = `genre:${decodeURIComponent(
-          genreMatch[1],
-        )}`;
+        id = `genre:${decodeURIComponent(genreMatch[1])}`;
       } else if (themeMatch) {
-        id = `theme:${decodeURIComponent(
-          themeMatch[1],
-        )}`;
+        id = `theme:${decodeURIComponent(themeMatch[1])}`;
       } else {
         continue;
       }
