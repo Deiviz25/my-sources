@@ -1,821 +1,903 @@
-/ mangadot.net — Harbor MangaProvider
-// Rebuilt from real MangaDot SSR data + documented JSON endpoints.
-// Harbor API: harbor.http / harbor.register only; no fetch/window/document.
-//
-// Confirmed from supplied MangaDot pages:
-// - Home SSR: loaderData -> pages/HomePage -> sectionsData.sections
-//   sections: most_tracked, top_rated, latest_updates, recently_added.
-// - Manga detail SSR: loaderData -> pages/MangaDetailPage -> mangaData.manga.
-// - Chapter reader SSR: pages/ChapterReaderPage contains chapter + manga metadata.
-// - Manga URLs: /manga/{id}
-// - Chapter URLs: /chapter/{id}[?source=user]
-//
-// Confirmed endpoint structure from independent recon:
-// - GET /api/search?search=...&sortBy=relevance&page=N -> {manga_list,pagination,...}
-// - GET /api/manga/{id}/chapters/list -> chapter array
-// - GET /api/chapters/{chapter_id}/images -> {chapter,images:[{url,w,h},...]}
+/*
+ * MangaDotNet Harbor Manga Source
+ *
+ * Portions of this implementation are adapted from:
+ * Mangadotnet-Scraper
+ * https://github.com/jianmingyong/Mangadotnet-Scraper
+ *
+ * Copyright (c) 2026 jianmingyong
+ *
+ * Licensed under the MIT License.
+ * The original copyright notice and permission notice are retained.
+ */
 
 const BASE_URL = "https://mangadot.net";
-const API_URL = `${BASE_URL}/api`;
-const PAGE_SIZE = 48;
-const BROWSER_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
+const API_URL = BASE_URL + "/api";
+const MANGA_PAGE = 48;
 
-// -----------------------------------------------------------------------------
-// Network
-// -----------------------------------------------------------------------------
+/* ---------------------------------------------------------
+ * Helpers
+ * --------------------------------------------------------- */
 
-async function fetchText(pathOrUrl) {
-  const url = pathOrUrl.startsWith("http")
-    ? pathOrUrl
-    : `${BASE_URL}${pathOrUrl}`;
+function absoluteUrl(value) {
+  if (!value) return null;
 
   try {
-    const res = await harbor.http(url, {
-      responseType: "text",
-      timeoutMs: 20000,
-      headers: {
-        "user-agent": BROWSER_UA,
-        accept: "text/html,application/xhtml+xml,text/plain,*/*",
-      },
-    });
+    const url = String(value).trim();
 
-    if (!res || !res.ok) {
-      harbor.log(`HTTP ${res?.status ?? "?"} en ${url}`);
-      return null;
+    if (!url) return null;
+
+    if (/^https?:\/\//i.test(url)) {
+      return url;
     }
 
-    return typeof res.body === "string" ? res.body : null;
-  } catch (e) {
-    harbor.log(`NETWORK ${url}: ${String(e).slice(0, 160)}`);
+    return new URL(url, BASE_URL).href;
+  } catch (_) {
     return null;
   }
 }
 
-async function fetchJson(urlOrPath) {
-  const url = urlOrPath.startsWith("http")
-    ? urlOrPath
-    : `${BASE_URL}${urlOrPath}`;
+function asString(value) {
+  if (value === null || value === undefined) return null;
 
-  try {
-    // With responseType=json Harbor returns the parsed JSON directly (or null).
-    const json = await harbor.http(url, {
-      responseType: "json",
-      timeoutMs: 25000,
-      headers: {
-        "user-agent": BROWSER_UA,
-        accept: "application/json,text/plain,*/*",
-      },
-    });
+  const result = String(value).trim();
 
-    return json == null ? null : json;
-  } catch (e) {
-    harbor.log(`JSON NETWORK ${url}: ${String(e).slice(0, 160)}`);
-    return null;
-  }
+  return result || null;
 }
 
-// -----------------------------------------------------------------------------
-// Generic helpers
-// -----------------------------------------------------------------------------
+function firstString(...values) {
+  for (const value of values) {
+    const result = asString(value);
 
-function absoluteUrl(url) {
-  if (!url) return undefined;
-  try {
-    return new URL(String(url), BASE_URL).toString();
-  } catch {
-    return undefined;
-  }
-}
-
-function cleanText(value) {
-  if (value == null) return undefined;
-  return String(value)
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;|&#x27;/g, "'")
-    .replace(/&amp;/g, "&")
-    .replace(/&nbsp;/g, " ")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+\n/g, "\n")
-    .replace(/\n\s+/g, "\n")
-    .trim();
-}
-
-function statusMap(raw, hiatus) {
-  const s = String(raw || "").toLowerCase();
-  if (hiatus && String(hiatus).toLowerCase() !== "no") return "hiatus";
-  if (s.includes("complete") || s.includes("finish") || s.includes("final")) {
-    return "completed";
-  }
-  if (s.includes("ongoing") || s.includes("progress")) return "ongoing";
-  if (s.includes("hiatus")) return "hiatus";
-  return "unknown";
-}
-
-function buildParams(params) {
-  const parts = [];
-
-  for (const [key, value] of Object.entries(params || {})) {
-    if (value == null || value === "") continue;
-
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(item)}`);
-      }
-    } else {
-      parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
+    if (result !== null) {
+      return result;
     }
-  }
-
-  return parts.join("&");
-}
-
-// -----------------------------------------------------------------------------
-// React Router SSR hydration
-// -----------------------------------------------------------------------------
-
-function extractHydrationPayload(html) {
-  if (!html) return null;
-
-  const re =
-    /streamController\.enqueue\("((?:\\.|[^"\\])*)"\);/g;
-
-  const chunks = [];
-  let m;
-
-  while ((m = re.exec(html)) !== null) {
-    try {
-      // The argument is a normal JavaScript string literal.
-      // In the real page keys are "_123", so JSON decoding is sufficient.
-      const decoded = JSON.parse(`"${m[1]}"`);
-      const parsed = JSON.parse(decoded);
-      if (Array.isArray(parsed)) chunks.push(parsed);
-    } catch {
-      // Ignore malformed/auxiliary chunks and try the next one.
-    }
-  }
-
-  if (!chunks.length) {
-    harbor.log("Hydration: no usable streamController.enqueue payload");
-    return null;
-  }
-
-  // Current MangaDot pages place the full flat table in one chunk.
-  // If several are present, prefer the largest table.
-  chunks.sort((a, b) => b.length - a.length);
-  return chunks[0];
-}
-
-function hydrate(rootIndex, table) {
-  const seen = new Map();
-
-  function resolve(value) {
-    if (value === -5) return null;
-
-    if (typeof value === "number" && typeof table[value] === "string") {
-      const s = table[value].trim();
-
-      if (s.startsWith("[") && s.endsWith("]")) {
-        try {
-          return JSON.parse(s);
-        } catch {
-          // Fall through to normal reference resolution.
-        }
-      }
-    }
-
-    if (typeof value === "number" && table[value] !== undefined) {
-      return walk(table[value]);
-    }
-
-    return walk(value);
-  }
-
-  function walk(node) {
-    if (node == null) return node;
-
-    if (typeof node === "object") {
-      if (seen.has(node)) return seen.get(node);
-
-      if (Array.isArray(node)) {
-        const out = [];
-        seen.set(node, out);
-        for (const value of node) out.push(resolve(value));
-        return out;
-      }
-
-      const out = {};
-      seen.set(node, out);
-
-      for (const [key, value] of Object.entries(node)) {
-        const realKey = key.startsWith("_")
-          ? table[Number(key.slice(1))]
-          : key;
-
-        if (realKey == null) continue;
-        out[realKey] = resolve(value);
-      }
-
-      return out;
-    }
-
-    return node;
-  }
-
-  return resolve(rootIndex);
-}
-
-function hydrateRoots(table, maxRoots = 50) {
-  if (!Array.isArray(table)) return [];
-
-  const roots = [];
-  const max = Math.min(maxRoots, table.length);
-
-  for (let i = 0; i < max; i++) {
-    try {
-      const value = hydrate(i, table);
-      if (value && typeof value === "object" && !Array.isArray(value)) {
-        roots.push({ index: i, value });
-      }
-    } catch {
-      // Continue scanning other possible roots.
-    }
-  }
-
-  return roots;
-}
-
-function findObjectByKeys(value, predicate, seen = new Set()) {
-  if (value == null || typeof value !== "object") return null;
-  if (seen.has(value)) return null;
-  seen.add(value);
-
-  if (predicate(value)) return value;
-
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const found = findObjectByKeys(item, predicate, seen);
-      if (found) return found;
-    }
-    return null;
-  }
-
-  for (const child of Object.values(value)) {
-    const found = findObjectByKeys(child, predicate, seen);
-    if (found) return found;
   }
 
   return null;
 }
 
-function findMangaNode(hydrated) {
-  return findObjectByKeys(
-    hydrated,
-    (x) =>
-      x &&
-      typeof x === "object" &&
-      x.id != null &&
-      x.title != null &&
-      (x.photo != null || x.description != null) &&
-      !Array.isArray(x)
-  );
+function asNumber(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const number = Number(value);
+
+  return Number.isFinite(number) ? number : null;
 }
 
-function findMangaData(hydrated) {
-  const data = findObjectByKeys(
-    hydrated,
-    (x) =>
-      x &&
-      typeof x === "object" &&
-      x.manga &&
-      x.total_chapters != null
-  );
-  return data || null;
+function pageFromOffset(offset) {
+  return Math.floor(Math.max(0, offset || 0) / MANGA_PAGE) + 1;
 }
 
-function findHomeSections(hydrated) {
-  const sectionsData = findObjectByKeys(
-    hydrated,
-    (x) =>
-      x &&
-      typeof x === "object" &&
-      x.sections &&
-      typeof x.sections === "object" &&
-      x.sections.most_tracked
-  );
+/* ---------------------------------------------------------
+ * MangaDot pointer-table decoder
+ *
+ * MangaDot's .data endpoints return a JSON pointer table.
+ * This is the same basic mechanism used by the Python scraper.
+ * --------------------------------------------------------- */
 
-  return sectionsData?.sections || null;
+function resolvePointerTable(table, index, visited) {
+  if (!Array.isArray(table)) {
+    return table;
+  }
+
+  if (index < 0 || index >= table.length) {
+    return null;
+  }
+
+  const seen = visited || new Set();
+
+  if (seen.has(index)) {
+    return null;
+  }
+
+  const nextSeen = new Set(seen);
+  nextSeen.add(index);
+
+  const value = table[index];
+
+  if (value === null || value === undefined) {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    const result = [];
+
+    for (const item of value) {
+      if (typeof item === "number") {
+        if (item < 0) {
+          result.push(null);
+        } else {
+          result.push(
+            resolvePointerTable(table, item, nextSeen)
+          );
+        }
+      } else {
+        result.push(item);
+      }
+    }
+
+    return result;
+  }
+
+  if (typeof value === "object") {
+    const result = {};
+
+    for (const key of Object.keys(value)) {
+      let outputKey = key;
+      const rawValue = value[key];
+
+      /*
+       * MangaDot uses "_0", "_1", etc. for references
+       * to property names in the pointer table.
+       */
+      if (/^_\d+$/.test(key)) {
+        const keyIndex = Number(key.substring(1));
+        const resolvedKey = resolvePointerTable(
+          table,
+          keyIndex,
+          nextSeen
+        );
+
+        if (typeof resolvedKey === "string") {
+          outputKey = resolvedKey;
+        }
+      }
+
+      if (typeof rawValue === "number") {
+        result[outputKey] =
+          rawValue < 0
+            ? null
+            : resolvePointerTable(
+                table,
+                rawValue,
+                nextSeen
+              );
+      } else {
+        result[outputKey] = rawValue;
+      }
+    }
+
+    return result;
+  }
+
+  return value;
 }
 
-// -----------------------------------------------------------------------------
-// Manga mapping
-// -----------------------------------------------------------------------------
+function parsePointerTable(text) {
+  if (!text) return null;
 
-function mangaFromNode(manga) {
-  if (!manga || manga.id == null || manga.title == null) return null;
+  let data;
+
+  try {
+    data = JSON.parse(text);
+  } catch (_) {
+    /*
+     * Try to recover JSON if MangaDot adds surrounding data.
+     */
+    const arrayStart = text.indexOf("[");
+    const objectStart = text.indexOf("{");
+
+    let start = -1;
+
+    if (arrayStart >= 0 && objectStart >= 0) {
+      start = Math.min(arrayStart, objectStart);
+    } else if (arrayStart >= 0) {
+      start = arrayStart;
+    } else {
+      start = objectStart;
+    }
+
+    if (start < 0) {
+      return null;
+    }
+
+    try {
+      data = JSON.parse(text.substring(start));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  if (Array.isArray(data)) {
+    return resolvePointerTable(data, 0);
+  }
+
+  return data;
+}
+
+/* ---------------------------------------------------------
+ * HTTP
+ * --------------------------------------------------------- */
+
+async function getText(path, timeoutMs) {
+  const url = path.startsWith("http")
+    ? path
+    : BASE_URL + path;
+
+  const response = await harbor.http(url, {
+    method: "GET",
+    headers: {
+      "Accept":
+        "application/json, text/x-script, text/plain, */*",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+        "AppleWebKit/537.36 (KHTML, like Gecko) " +
+        "Chrome/140.0.0.0 Safari/537.36"
+    },
+    responseType: "text",
+    timeoutMs: timeoutMs || 20000
+  });
+
+  if (!response || !response.ok) {
+    if (response) {
+      harbor.log(
+        "MangaDot HTTP error:",
+        response.status,
+        path
+      );
+    }
+
+    return null;
+  }
+
+  return response.body || "";
+}
+
+async function getJson(path, timeoutMs) {
+  const text = await getText(path, timeoutMs);
+
+  if (!text) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    return null;
+  }
+}
+
+/* ---------------------------------------------------------
+ * Search
+ * --------------------------------------------------------- */
+
+function extractSearchResults(data) {
+  if (!data) return [];
+
+  if (Array.isArray(data)) {
+    return data;
+  }
+
+  const candidates = [
+    data.manga_list,
+    data.mangaList,
+    data.results,
+    data.items,
+
+    data.payload &&
+      data.payload.manga_list,
+
+    data.payload &&
+      data.payload.results,
+
+    data.data &&
+      data.data.manga_list,
+
+    data.data &&
+      data.data.results
+  ];
+
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      return candidate;
+    }
+  }
+
+  return [];
+}
+
+async function searchManga(query, page) {
+  /*
+   * First try MangaDot's JSON API.
+   */
+  const params = new URLSearchParams();
+
+  params.set("search", query);
+  params.set("sortBy", "relevance");
+  params.set("page", String(page));
+
+  const api = await getJson(
+    API_URL + "/search?" + params.toString(),
+    18000
+  );
+
+  if (api) {
+    return api;
+  }
+
+  /*
+   * Fallback to the exact endpoint used by
+   * Mangadotnet-Scraper.
+   */
+  const dataParams = new URLSearchParams();
+
+  dataParams.set("search", query);
+  dataParams.set(
+    "_routes",
+    "pages/SearchPage"
+  );
+
+  const raw = await getText(
+    "/search.data?" + dataParams.toString(),
+    18000
+  );
+
+  if (!raw) {
+    return null;
+  }
+
+  return parsePointerTable(raw);
+}
+
+/* ---------------------------------------------------------
+ * Summary
+ * --------------------------------------------------------- */
+
+function makeSummary(manga) {
+  if (!manga || typeof manga !== "object") {
+    return null;
+  }
+
+  const id = firstString(
+    manga.id,
+    manga.manga_id,
+    manga.mangaId,
+    manga.slug
+  );
+
+  const title = firstString(
+    manga.title,
+    manga.name
+  );
+
+  if (!id || !title) {
+    return null;
+  }
+
+  let author = null;
+
+  if (Array.isArray(manga.authors)) {
+    author = manga.authors
+      .map(author => {
+        if (typeof author === "string") {
+          return author;
+        }
+
+        if (
+          author &&
+          typeof author === "object"
+        ) {
+          return firstString(
+            author.name,
+            author.title
+          );
+        }
+
+        return null;
+      })
+      .filter(Boolean)
+      .join(", ");
+  } else {
+    author = firstString(
+      manga.author,
+      manga.authors,
+      manga.author_name,
+      manga.authorName
+    );
+  }
+
+  const cover = absoluteUrl(
+    firstString(
+      manga.cover_url,
+      manga.cover,
+      manga.coverUrl,
+      manga.thumbnail,
+      manga.image,
+      manga.poster
+    )
+  );
+
+  const year = asNumber(
+    manga.year ||
+    manga.release_year ||
+    manga.releaseYear
+  );
 
   const result = {
-    id: String(manga.id),
-    title: cleanText(manga.title) || String(manga.id),
-    cover: absoluteUrl(manga.photo),
-    description: cleanText(manga.description),
-    status: statusMap(manga.status, manga.hiatus),
-    genres: Array.isArray(manga.genres) ? manga.genres : undefined,
-    author: Array.isArray(manga.authors) && manga.authors.length
-      ? manga.authors.join(" & ")
-      : undefined,
-    artist: Array.isArray(manga.artists) && manga.artists.length
-      ? manga.artists.join(" & ")
-      : undefined,
-    year: Number.isFinite(Number(manga.year))
-      ? Number(manga.year)
-      : undefined,
-    contentRating: manga.content_rating
-      ? String(manga.content_rating)
-      : undefined,
-    lastChapter:
-      manga.latest_chapter_number != null
-        ? String(manga.latest_chapter_number)
-        : undefined,
+    id: String(id),
+    title: title
   };
+
+  if (cover) {
+    result.cover = cover;
+  }
+
+  if (year !== null) {
+    result.year = year;
+  }
+
+  const altTitle = firstString(
+    manga.alt_title,
+    manga.altTitle,
+    manga.alt_titles,
+    manga.alternative_title
+  );
+
+  if (altTitle) {
+    result.altTitle = altTitle;
+  }
+
+  const description = firstString(
+    manga.description,
+    manga.summary,
+    manga.synopsis
+  );
+
+  if (description) {
+    result.description = description;
+  }
+
+  const status = firstString(
+    manga.status,
+    manga.publication_status,
+    manga.publicationStatus
+  );
+
+  if (status) {
+    result.status =
+      status.toLowerCase().includes("complete")
+        ? "completed"
+        : status.toLowerCase().includes("ongoing")
+          ? "ongoing"
+          : status;
+  }
+
+  const contentRating = firstString(
+    manga.content_rating,
+    manga.contentRating
+  );
+
+  if (contentRating) {
+    result.contentRating = contentRating;
+  }
+
+  const lastChapter = firstString(
+    manga.last_chapter,
+    manga.lastChapter,
+    manga.latest_chapter,
+    manga.latestChapter
+  );
+
+  if (lastChapter) {
+    result.lastChapter = lastChapter;
+  }
+
+  if (author) {
+    result.author = author;
+  }
 
   return result;
 }
 
-function mapSearchItem(item) {
-  if (!item || item.id == null || !item.title) return null;
+/* ---------------------------------------------------------
+ * Detail
+ * --------------------------------------------------------- */
 
-  return {
-    id: String(item.id),
-    title: cleanText(item.title) || String(item.id),
-    cover: absoluteUrl(item.photo),
-    description: cleanText(item.description),
-    status: statusMap(item.status, item.hiatus),
-    genres: Array.isArray(item.genres) ? item.genres : undefined,
-    author: Array.isArray(item.authors) && item.authors.length
-      ? item.authors.join(" & ")
-      : undefined,
-    artist: Array.isArray(item.artists) && item.artists.length
-      ? item.artists.join(" & ")
-      : undefined,
-    lastChapter:
-      item.latest_chapter_number != null
-        ? String(item.latest_chapter_number)
-        : undefined,
-  };
-}
-
-// -----------------------------------------------------------------------------
-// JSON search / lists
-// -----------------------------------------------------------------------------
-
-function extractMangaArray(json) {
-  if (!json || typeof json !== "object") return [];
-
-  const candidates = [
-    json.manga_list,
-    json.results,
-    json.items,
-    json.data,
-    json.manga,
-  ];
-
-  for (const value of candidates) {
-    if (Array.isArray(value)) return value;
+function extractManga(data) {
+  if (!data || typeof data !== "object") {
+    return null;
   }
 
-  return [];
+  if (
+    data.mangaData &&
+    data.mangaData.manga
+  ) {
+    return data.mangaData.manga;
+  }
+
+  if (data.manga) {
+    return data.manga;
+  }
+
+  if (
+    data.data &&
+    data.data.mangaData &&
+    data.data.mangaData.manga
+  ) {
+    return data.data.mangaData.manga;
+  }
+
+  if (
+    data.data &&
+    data.data.manga
+  ) {
+    return data.data.manga;
+  }
+
+  return data;
 }
 
-async function searchApi(query, offset, sortBy, tagId) {
-  const page = Math.floor(offset / PAGE_SIZE) + 1;
-
-  const params = {
-    search: query || undefined,
-    sortBy: sortBy || "relevance",
-    page,
-    perPage: PAGE_SIZE,
-    per_page: PAGE_SIZE,
-  };
-
-  // Keep both commonly-used spellings as a graceful compatibility fallback.
-  if (tagId) params.genre = tagId;
-
-  const url = `${API_URL}/search?${buildParams(params)}`;
-  const json = await fetchJson(url);
-
-  if (!json) return [];
-
-  const items = extractMangaArray(json);
-  if (!items.length) return [];
-
-  return items.map(mapSearchItem).filter(Boolean);
-}
-
-async function searchDataFallback(query, offset, tagId) {
-  const page = Math.floor(offset / PAGE_SIZE) + 1;
-
-  const params = {
-    adult: 1,
-    page,
-    perPage: PAGE_SIZE,
-    _routes: "pages/SearchPage",
-  };
-
-  if (query) params.search = query;
-  if (tagId) params.genre = [tagId];
-
-  const json = await fetchJson(
-    `${BASE_URL}/search.data?${buildParams(params)}`
+async function getManga(id) {
+  /*
+   * Try API first.
+   */
+  const api = await getJson(
+    API_URL +
+      "/manga/" +
+      encodeURIComponent(id),
+    20000
   );
 
-  if (!json) return [];
-
-  const table = Array.isArray(json) ? json : null;
-
-  if (table) {
-    const roots = hydrateRoots(table);
-    for (const root of roots) {
-      const list = findObjectByKeys(
-        root.value,
-        (x) =>
-          x &&
-          typeof x === "object" &&
-          (Array.isArray(x.results) || Array.isArray(x.manga_list))
-      );
-
-      const raw = list?.results || list?.manga_list;
-      if (Array.isArray(raw)) {
-        return raw.map(mapSearchItem).filter(Boolean);
-      }
-    }
+  if (api) {
+    return api;
   }
 
-  return extractMangaArray(json).map(mapSearchItem).filter(Boolean);
+  /*
+   * Exact .data endpoint from the scraper.
+   */
+  const params = new URLSearchParams();
+
+  params.set(
+    "_routes",
+    "pages/MangaDetailPage"
+  );
+
+  const raw = await getText(
+    "/manga/" +
+      encodeURIComponent(id) +
+      ".data?" +
+      params.toString(),
+    20000
+  );
+
+  if (!raw) {
+    return null;
+  }
+
+  return parsePointerTable(raw);
 }
 
-// -----------------------------------------------------------------------------
-// Home SSR
-// -----------------------------------------------------------------------------
+/* ---------------------------------------------------------
+ * Chapters
+ * --------------------------------------------------------- */
 
-async function homeItems(sectionName) {
-  const html = await fetchText("/");
-  if (!html) return [];
+async function getChapters(id) {
+  const primary = await getJson(
+    API_URL +
+      "/manga/" +
+      encodeURIComponent(id) +
+      "/chapters/list",
+    22000
+  );
 
-  const table = extractHydrationPayload(html);
-  if (!table) return [];
+  if (Array.isArray(primary)) {
+    return primary;
+  }
 
-  const roots = hydrateRoots(table);
+  if (
+    primary &&
+    Array.isArray(primary.chapters)
+  ) {
+    return primary.chapters;
+  }
 
-  for (const root of roots) {
-    const sections = findHomeSections(root.value);
-    if (!sections) continue;
+  if (
+    primary &&
+    Array.isArray(primary.data)
+  ) {
+    return primary.data;
+  }
 
-    const section = sections[sectionName];
-    if (!section || !Array.isArray(section.items)) continue;
+  /*
+   * Fallback used by older MangaDot implementations.
+   */
+  const fallback = await getJson(
+    API_URL +
+      "/manga/" +
+      encodeURIComponent(id) +
+      "/chapters",
+    22000
+  );
 
-    return section.items.map(mapSearchItem).filter(Boolean);
+  if (Array.isArray(fallback)) {
+    return fallback;
+  }
+
+  if (
+    fallback &&
+    Array.isArray(fallback.chapters)
+  ) {
+    return fallback.chapters;
   }
 
   return [];
 }
 
-// -----------------------------------------------------------------------------
-// MangaProvider
-// -----------------------------------------------------------------------------
+function makeChapter(chapter) {
+  if (!chapter || typeof chapter !== "object") {
+    return null;
+  }
+
+  const id = firstString(
+    chapter.id,
+    chapter.chapter_id,
+    chapter.chapterId
+  );
+
+  if (!id) {
+    return null;
+  }
+
+  const chapterNumber =
+    chapter.chapter_number !== undefined
+      ? chapter.chapter_number
+      : chapter.chapterNumber;
+
+  const volumeNumber =
+    chapter.volume_number !== undefined
+      ? chapter.volume_number
+      : chapter.volumeNumber;
+
+  const result = {
+    id: String(id),
+    chapter:
+      chapterNumber === null ||
+      chapterNumber === undefined ||
+      chapterNumber === ""
+        ? null
+        : String(chapterNumber),
+
+    pages: 0,
+
+    language:
+      firstString(
+        chapter.language,
+        chapter.lang
+      ) || "en"
+  };
+
+  const title = firstString(
+    chapter.chapter_title,
+    chapter.chapterTitle,
+    chapter.title,
+    chapter.name
+  );
+
+  if (title) {
+    result.title = title;
+  }
+
+  if (
+    volumeNumber !== null &&
+    volumeNumber !== undefined &&
+    volumeNumber !== ""
+  ) {
+    result.volume = String(volumeNumber);
+  }
+
+  const group = firstString(
+    chapter.scanlator_name,
+    chapter.scanlatorName,
+    chapter.group_name,
+    chapter.groupName
+  );
+
+  if (group) {
+    result.group = group;
+  }
+
+  const date = firstString(
+    chapter.date_added,
+    chapter.dateAdded,
+    chapter.publish_at,
+    chapter.publishAt,
+    chapter.published_at
+  );
+
+  if (date) {
+    result.publishAt = date;
+  }
+
+  const pageCount = asNumber(
+    chapter.page_count !== undefined
+      ? chapter.page_count
+      : chapter.pageCount !== undefined
+        ? chapter.pageCount
+        : chapter.pages
+  );
+
+  if (pageCount !== null) {
+    result.pages = Math.max(
+      0,
+      Math.floor(pageCount)
+    );
+  }
+
+  return result;
+}
+
+/* ---------------------------------------------------------
+ * Chapter pages
+ * --------------------------------------------------------- */
+
+async function getPages(chapterId) {
+  const data = await getJson(
+    API_URL +
+      "/chapters/" +
+      encodeURIComponent(chapterId) +
+      "/images",
+    28000
+  );
+
+  if (!data) {
+    return [];
+  }
+
+  let images = [];
+
+  if (Array.isArray(data)) {
+    images = data;
+  } else if (
+    Array.isArray(data.images)
+  ) {
+    images = data.images;
+  } else if (
+    data.data &&
+    Array.isArray(data.data.images)
+  ) {
+    images = data.data.images;
+  }
+
+  const pages = [];
+
+  for (const image of images) {
+    let url = null;
+
+    if (typeof image === "string") {
+      url = image;
+    } else if (
+      image &&
+      typeof image === "object"
+    ) {
+      url = firstString(
+        image.url,
+        image.src,
+        image.image_url,
+        image.imageUrl
+      );
+    }
+
+    const absolute = absoluteUrl(url);
+
+    if (
+      absolute &&
+      /^https?:\/\//i.test(absolute)
+    ) {
+      pages.push(absolute);
+    }
+  }
+
+  return pages;
+}
+
+/* ---------------------------------------------------------
+ * Harbor provider
+ * --------------------------------------------------------- */
 
 const plugin = {
-  id: "mangadot",
-  name: "MangaDot",
+  id: "mangadotnet",
+
+  name: "MangaDotNet",
 
   async popular(offset, tagId) {
-    if (tagId) {
-      let items = await searchApi("", offset, "tracked", tagId);
+    const page = pageFromOffset(offset);
 
-      if (!items.length) {
-        items = await searchDataFallback("", offset, tagId);
-      }
+    const data = await searchManga("", page);
 
-      return items;
-    }
-
-    // The real home SSR exposes 21-item sections. Use it for the first page.
-    if (offset === 0) {
-      const sections = [
-        "most_tracked",
-        "top_rated",
-        "latest_updates",
-        "recently_added",
-      ];
-
-      const out = [];
-      const seen = new Set();
-
-      for (const section of sections) {
-        const items = await homeItems(section);
-
-        for (const item of items) {
-          if (seen.has(item.id)) continue;
-          seen.add(item.id);
-          out.push(item);
-
-          if (out.length >= PAGE_SIZE) {
-            return out;
-          }
-        }
-      }
-
-      if (out.length) return out;
-    }
-
-    // Subsequent pages use the clean JSON search endpoint.
-    let items = await searchApi("", offset, "tracked", null);
-
-    if (!items.length) {
-      items = await searchDataFallback("", offset, null);
-    }
-
-    return items;
+    return extractSearchResults(data)
+      .map(makeSummary)
+      .filter(Boolean)
+      .slice(0, MANGA_PAGE);
   },
 
   async search(query, offset, tagId) {
-    if (!query && tagId) {
-      let items = await searchApi("", offset, "relevance", tagId);
-      if (!items.length) items = await searchDataFallback("", offset, tagId);
-      return items;
+    const search = String(query || "").trim();
+
+    if (!search) {
+      return [];
     }
 
-    if (!query) return [];
+    const page = pageFromOffset(offset);
 
-    let items = await searchApi(query, offset, "relevance", tagId);
+    const data = await searchManga(
+      search,
+      page
+    );
 
-    if (!items.length) {
-      items = await searchDataFallback(query, offset, tagId);
-    }
+    const results = extractSearchResults(data);
 
-    return items;
+    return results
+      .map(makeSummary)
+      .filter(Boolean)
+      .slice(0, MANGA_PAGE);
   },
 
   async detail(id) {
-    const encodedId = encodeURIComponent(String(id));
-
-    // Clean JSON endpoint first.
-    let json = await fetchJson(`${API_URL}/manga/${encodedId}`);
-
-    if (json) {
-      const direct = findMangaNode(json);
-      if (direct) {
-        const base = mangaFromNode(direct);
-        if (base) {
-          const mangaData = findMangaData(json);
-          if (mangaData?.latest_chapter_number != null) {
-            base.lastChapter = String(mangaData.latest_chapter_number);
-          }
-          return base;
-        }
-      }
+    if (!id) {
+      return null;
     }
 
-    // SSR HTML fallback.
-    const html = await fetchText(`${BASE_URL}/manga/${encodedId}`);
-    if (!html) return null;
+    const data = await getManga(
+      String(id)
+    );
 
-    const table = extractHydrationPayload(html);
-
-    if (table) {
-      const roots = hydrateRoots(table);
-
-      for (const root of roots) {
-        const mangaData = findMangaData(root.value);
-        const manga = mangaData?.manga || findMangaNode(root.value);
-
-        if (!manga) continue;
-
-        const result = mangaFromNode(manga);
-        if (!result) continue;
-
-        if (mangaData?.latest_chapter_number != null) {
-          result.lastChapter = String(mangaData.latest_chapter_number);
-        }
-
-        return result;
-      }
+    if (!data) {
+      return null;
     }
 
-    return null;
+    const manga = extractManga(data);
+
+    if (!manga) {
+      return null;
+    }
+
+    /*
+     * Keep Harbor's original ID stable.
+     */
+    const copy = {
+      ...manga,
+      id:
+        manga.id !== undefined
+          ? manga.id
+          : id
+    };
+
+    return makeSummary(copy);
   },
 
   async chapters(id) {
-    const mangaId = encodeURIComponent(String(id));
-
-    // Confirmed API shape:
-    // [{id, chapter_number, language, page_count, scanlator_name,
-    //   date_added, source, ...}]
-    const endpoints = [
-      `${API_URL}/manga/${mangaId}/chapters/list`,
-      `${API_URL}/manga/${mangaId}/chapters`,
-    ];
-
-    let data = null;
-
-    for (const endpoint of endpoints) {
-      data = await fetchJson(endpoint);
-      if (Array.isArray(data)) break;
-      if (data && Array.isArray(data.chapters)) {
-        data = data.chapters;
-        break;
-      }
-      if (data && Array.isArray(data.data)) {
-        data = data.data;
-        break;
-      }
-      data = null;
-    }
-
-    if (!Array.isArray(data)) {
-      harbor.log(`No se obtuvieron capítulos para manga ${id}`);
+    if (!id) {
       return [];
     }
 
-    const chapters = data
-      .map((c) => {
-        if (!c || c.id == null) return null;
+    const chapters = await getChapters(
+      String(id)
+    );
 
-        const number =
-          c.chapter_number ??
-          c.number ??
-          c.chapterNumber ??
-          null;
-
-        const source = c.source ? String(c.source) : "";
-
-        // Reader URL proven in the supplied chapter:
-        // /chapter/{id}?source=user
-        const readerId =
-          source === "user"
-            ? `${c.id}?source=user`
-            : String(c.id);
-
-        return {
-          id: readerId,
-          chapter: number == null ? null : String(number),
-          title:
-            c.chapter_title ||
-            c.title ||
-            (number != null ? `Chapter ${number}` : `Chapter ${c.id}`),
-          volume:
-            c.volume_number != null
-              ? String(c.volume_number)
-              : c.volume != null
-                ? String(c.volume)
-                : null,
-          pages: Number.isFinite(Number(c.page_count))
-            ? Number(c.page_count)
-            : Number.isFinite(Number(c.pages))
-              ? Number(c.pages)
-              : 0,
-          language: c.language ? String(c.language) : "en",
-          group:
-            c.scanlator_name ||
-            c.group_name ||
-            c.scanlator_group ||
-            c.group ||
-            undefined,
-          publishAt:
-            c.date_added ||
-            c.upload_date ||
-            c.created_at ||
-            c.date ||
-            undefined,
-        };
-      })
-      .filter(Boolean);
-
-    // Harbor expects a stable, ascending chapter sequence.
-    chapters.sort((a, b) => {
-      const an = parseFloat(a.chapter);
-      const bn = parseFloat(b.chapter);
-
-      if (Number.isFinite(an) && Number.isFinite(bn)) {
-        if (an !== bn) return an - bn;
-      } else if (Number.isFinite(an)) {
-        return -1;
-      } else if (Number.isFinite(bn)) {
-        return 1;
-      }
-
-      return String(a.id).localeCompare(String(b.id));
-    });
-
-    return chapters;
+    return chapters
+      .map(makeChapter)
+      .filter(Boolean)
+      .slice(0, 5000);
   },
 
   async pageUrls(chapterId) {
-    const textId = String(chapterId);
-    const rawId = textId.split("?")[0];
-    const encoded = encodeURIComponent(rawId);
-
-    // The clean manifest endpoint is confirmed for MangaDot.
-    const endpoints = [
-      `${API_URL}/chapters/${encoded}/images`,
-      `${API_URL}/uploads/${encoded}/images`,
-    ];
-
-    let json = null;
-
-    for (const endpoint of endpoints) {
-      json = await fetchJson(endpoint);
-      if (json) break;
-    }
-
-    if (!json) {
-      // Last fallback: reader HTML can still be useful for a future markup
-      // variation, although current MangaDot exposes the manifest through API.
-      const html = await fetchText(
-        `${BASE_URL}/chapter/${encodeURIComponent(rawId)}`
-      );
-
-      if (html) {
-        const candidates = [];
-        const re =
-          /(?:src|data-src|data-original)=["'](https?:\/\/[^"']+|\/chapters\/[^"']+\.(?:webp|jpg|jpeg|png))["']/gi;
-
-        let m;
-        while ((m = re.exec(html)) !== null) {
-          const url = absoluteUrl(m[1]);
-          if (url) candidates.push(url);
-        }
-
-        return [...new Set(candidates)];
-      }
-
+    if (!chapterId) {
       return [];
     }
 
-    const images = Array.isArray(json)
-      ? json
-      : Array.isArray(json.images)
-        ? json.images
-        : Array.isArray(json.data)
-          ? json.data
-          : [];
+    const pages = await getPages(
+      String(chapterId)
+    );
 
-    const result = [];
-
-    for (const image of images) {
-      let url;
-
-      if (typeof image === "string") {
-        url = image;
-      } else if (image && typeof image === "object") {
-        url = image.url || image.src || image.image || image.link;
-      }
-
-      const absolute = absoluteUrl(url);
-      if (absolute) result.push(absolute);
-    }
-
-    return [...new Set(result)];
-  },
-
-  async tags() {
-    // MangaDot's taxonomy includes these genre labels. Keeping them stable
-    // makes Harbor's tag filter usable without depending on visited titles.
-    const genres = [
-      "action", "Action", "adventure", "Adventure", "Aliens",
-      "Anthology", "award_winning", "Award Winning",
-      "boys' love", "Boys Love", "Boys' Love",
-      "comedy", "Comedy", "Comic", "Cooking", "Crime",
-      "Crossdressing", "Delinquents", "Demons", "drama", "Drama",
-      "ecchi", "Ecchi", "erotica", "Erotica", "fantasy", "Fantasy",
-      "female protagonist", "Fight", "gender_bender", "Gender Bender",
-      "Ghosts", "girls_love", "Girls love", "Girls Love",
-      "gore", "Gourmet", "Gyaru", "harem", "Harem",
-      "hentai", "Hentai", "historical", "Historical", "horror", "Horror",
-      "Isekai", "josei", "Josei", "Loli", "Lolicon", "Mafia",
-      "magic", "Magic", "Magical Girls", "Mahou Shoujo",
-      "manga", "Manga", "manhua", "Manhua", "manhwa", "Manhwa",
-      "martial arts", "Martial Arts", "Medical", "military", "Military",
-      "mecha", "Mecha", "Monster Girls", "Mystery", "music", "Music",
-      "Ninja", "office worker", "Office Workers", "Otome",
-      "Police", "Post-Apocalyptic", "psychological", "Psychological",
-      "reincarnation", "Reincarnation", "Reverse Harem",
-      "romance", "Romance", "royalty", "Samurai", "school_life",
-      "School life", "sci-fi", "Sci-fi", "seinen", "Seinen",
-      "shoujo", "Shoujo", "shoujo_ai", "Shoujo Ai",
-      "shounen", "Shounen", "slice_of_life", "Slice of life",
-      "sports", "Sports", "Supernatural", "Survival",
-      "suspense", "Suspense", "thriller", "Thriller",
-      "Time Travel", "tragedy", "Tragedy", "Vampires",
-      "Video Games", "Villainess", "Virtual Reality",
-      "War", "webtoon", "Webtoon", "webtoons", "wuxia", "Wuxia",
-      "yaoi", "Yaoi", "yuri", "Yuri", "Zombies",
-    ];
-
-    return genres.map((name) => ({ id: name, name }));
-  },
+    return pages
+      .filter(url =>
+        /^https?:\/\//i.test(url)
+      )
+      .slice(0, 2000);
+  }
 };
 
 harbor.register(plugin);
