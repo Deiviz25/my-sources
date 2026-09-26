@@ -33,7 +33,7 @@
       "id": "mangadotnet",
       "name": "MangaDotNet",
       "version": "1.0.0",
-      "lang": "es",
+      "lang": "en",
       "nsfw": false,
       "icon": "https://mangadot.net/favicon.ico",
       "entry": "mangadotnet.plugin.js"
