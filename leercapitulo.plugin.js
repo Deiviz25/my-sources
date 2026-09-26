@@ -150,12 +150,24 @@ function cleanText(text) {
   );
 }
 
+// CORREGIDO (bug real, confirmado contra HTML de ficha real): las URLs
+// de leercapitulo son /manga/{id}/{slug}/ — DOS segmentos, no uno. La
+// versión anterior de slugFromMangaHref cortaba en la primera "/", así
+// que `id` quedaba truncado a sólo el código corto (ej. "byywymjdxc"
+// en vez de "byywymjdxc/u-dont-know-me"). detail()/chapters() luego
+// reconstruían la URL como `/manga/${id}/`, pidiendo "/manga/byywymjdxc/"
+// — una URL SIN el slug que el sitio nunca sirve. Esto es, con bastante
+// seguridad, la causa real de "entro a un manga y da error": no es (o
+// no es sólo) protección anti-bot, es que la URL que se pedía estaba
+// incompleta. Ahora se captura la ruta completa (id + slug) como `id`,
+// así que `/manga/${id}/` reconstruye la URL real exacta.
 function slugFromMangaHref(href) {
   if (!href) return null;
 
-  const match = String(href).match(/\/manga\/([^/?#]+)/i);
+  const match = String(href).match(/\/manga\/([^?#]+?)\/?(?:[?#]|$)/i);
+  if (!match || !match[1]) return null;
 
-  return match ? match[1] : null;
+  return match[1];
 }
 
 // ============================================================
