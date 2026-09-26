@@ -170,6 +170,26 @@ function slugFromMangaHref(href) {
   return match[1];
 }
 
+// El `id` que expone Harbor hacia afuera (en MangaSummary.id) es opaco
+// según la doc, pero como puede terminar usándose dentro de una ruta o
+// URL interna de la app, es más seguro no meterle una "/" literal — si
+// la app lo trata como un único segmento de path, una barra ahí podría
+// romper su navegación (justo el síntoma: la lista carga bien, pero
+// falla al TOCAR un manga para abrir la ficha). Se codifica a un único
+// token con encodeURIComponent, y se decodifica sólo al reconstruir la
+// URL real en detail()/chapters().
+function encodeMangaId(rawPath) {
+  return encodeURIComponent(rawPath);
+}
+
+function decodeMangaId(id) {
+  try {
+    return decodeURIComponent(id);
+  } catch {
+    return id;
+  }
+}
+
 // ============================================================
 // Caché simple
 // ============================================================
@@ -293,7 +313,8 @@ function dedupeCardsBySlug(cards) {
 
 function cardsToResults(cards) {
   return cards.map((c) => {
-    const id = slugFromMangaHref(c.href);
+    const rawId = slugFromMangaHref(c.href);
+    const id = encodeMangaId(rawId);
     const result = {
       id,
       title: c.title,
@@ -383,9 +404,10 @@ const plugin = {
     for (const item of page) {
       if (!item) continue;
 
-      const id = slugFromMangaHref(item.link);
-      if (!id) continue;
+      const rawId = slugFromMangaHref(item.link);
+      if (!rawId) continue;
 
+      const id = encodeMangaId(rawId);
       const result = {
         id,
         title: cleanText(item.label) || id,
@@ -419,8 +441,9 @@ const plugin = {
     if (!id) return null;
 
     const cached = summaryCache.get(id);
+    const rawId = decodeMangaId(id);
 
-    const html = await fetchText(`/manga/${id}/`);
+    const html = await fetchText(`/manga/${rawId}/`);
 
     if (!html) {
       if (cached) return { ...cached };
@@ -499,7 +522,7 @@ const plugin = {
   // manga largo (ej. One Piece) sí pagina la lista, esto se quedará
   // corto igual que le pasaba a mangalect antes de su fix.
   async chapters(id, cachedHtml) {
-    let html = cachedHtml || (await fetchText(`/manga/${id}/`));
+    let html = cachedHtml || (await fetchText(`/manga/${decodeMangaId(id)}/`));
 
     if (!html) return [];
 
