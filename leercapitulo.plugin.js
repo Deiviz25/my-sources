@@ -1,39 +1,29 @@
-// leercapitulo.co — Harbor MangaProvider
-// V3 — estructura actual de LeerCapítulo
-//
-// Cambios principales:
-// - Fichas adaptadas al HTML actual.
-// - Los capítulos se detectan directamente mediante /leer/.
-// - Se extraen título, títulos alternativos, géneros, estado, autor,
-//   dibujo y sinopsis desde la ficha actual.
-// - El lector obtiene las imágenes directamente desde <img>.
-// - array_data queda como fallback para versiones antiguas.
-// - Mantiene search-autocomplete y catálogo.
-// - Compatible con Harbor MangaProvider.
-
 const BASE_URL = "https://www.leercapitulo.co";
 const PAGE_SIZE = 48;
 
-// ---------------------------------------------------------------------------
-// RED
-// ---------------------------------------------------------------------------
+// ============================================================
+// Helpers
+// ============================================================
 
 async function fetchText(path) {
   try {
     const url = path.startsWith("http")
       ? path
-      : `${BASE_URL}${path}`;
+      : `${BASE_URL}${path.startsWith("/") ? path : `/${path}`}`;
 
     const res = await harbor.http(url, {
       responseType: "text",
     });
 
-    if (!res || !res.ok) return null;
+    if (!res || !res.ok) {
+      harbor.log(`LeerCapitulo HTTP error: ${url}`);
+      return "";
+    }
 
-    return typeof res.body === "string" ? res.body : null;
+    return res.body || "";
   } catch (e) {
-    harbor.log(`NETWORK ${path}: ${String(e).slice(0, 200)}`);
-    return null;
+    harbor.log(`LeerCapitulo fetchText error: ${e}`);
+    return "";
   }
 }
 
@@ -41,646 +31,170 @@ async function fetchJson(path) {
   try {
     const url = path.startsWith("http")
       ? path
-      : `${BASE_URL}${path}`;
+      : `${BASE_URL}${path.startsWith("/") ? path : `/${path}`}`;
 
-    const json = await harbor.http(url, {
+    return await harbor.http(url, {
       responseType: "json",
     });
-
-    return json == null ? null : json;
   } catch (e) {
-    harbor.log(`JSON NETWORK ${path}: ${String(e).slice(0, 200)}`);
+    harbor.log(`LeerCapitulo fetchJson error: ${e}`);
     return null;
   }
 }
 
-// ---------------------------------------------------------------------------
-// UTILIDADES
-// ---------------------------------------------------------------------------
-
 function absoluteUrl(url) {
   if (!url) return undefined;
 
-  try {
-    return new URL(url, BASE_URL).toString();
-  } catch (e) {
-    return undefined;
+  const value = String(url).trim();
+
+  if (!value) return undefined;
+
+  if (value.startsWith("//")) {
+    return `https:${value}`;
   }
+
+  if (/^https?:\/\//i.test(value)) {
+    return value;
+  }
+
+  if (value.startsWith("/")) {
+    return `${BASE_URL}${value}`;
+  }
+
+  return `${BASE_URL}/${value}`;
 }
 
-function cleanText(value) {
-  if (!value) return "";
+function decodeEntities(text) {
+  if (!text) return "";
 
-  return String(value)
-    .replace(/\s+/g, " ")
-    .replace(/\u00a0/g, " ")
-    .trim();
-}
-
-function decodeEntities(str) {
-  if (!str) return "";
-
-  return String(str)
-    .replace(/&quot;/gi, '"')
-    .replace(/&#0?39;/gi, "'")
-    .replace(/&#x27;/gi, "'")
+  return String(text)
     .replace(/&amp;/gi, "&")
-    .replace(/&nbsp;/gi, " ")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&apos;/gi, "'")
     .replace(/&lt;/gi, "<")
     .replace(/&gt;/gi, ">")
-    .trim();
+    .replace(/&#(\d+);/g, (_, n) => {
+      try {
+        return String.fromCharCode(Number(n));
+      } catch {
+        return _;
+      }
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => {
+      try {
+        return String.fromCharCode(parseInt(n, 16));
+      } catch {
+        return _;
+      }
+    });
 }
 
-function pageFromOffset(offset) {
-  return Math.floor((offset || 0) / PAGE_SIZE) + 1;
+function cleanText(text) {
+  if (!text) return "";
+
+  return decodeEntities(
+    String(text)
+      .replace(/<br\s*\/?>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
 }
 
 function slugFromMangaHref(href) {
-  if (!href) return "";
+  if (!href) return null;
 
-  const parts = href.split("/").filter(Boolean);
+  const match = String(href).match(/\/manga\/([^/?#]+)/i);
 
-  if (parts[0] === "manga") {
-    return parts[1] || href;
-  }
-
-  return href;
+  return match ? match[1] : null;
 }
 
-// ---------------------------------------------------------------------------
-// TARJETAS DE MANGA
-// ---------------------------------------------------------------------------
+function normalizeId(id) {
+  if (!id) return "";
 
-function parseHotMangaBlocks(html) {
-  const results = [];
-
-  const re =
-    /<div class="hot-manga[^"]*"[\s\S]*?<a href="(\/manga\/[^"]+\/)"[^>]*>[\s\S]*?<img[^>]*(?:data-src|src)="([^"]+)"[\s\S]*?<h3 class="manga-title">([^<]+)<\/h3>/gi;
-
-  let m;
-
-  while ((m = re.exec(html)) !== null) {
-    results.push({
-      href: m[1],
-      cover: m[2],
-      title: decodeEntities(m[3]),
-    });
-  }
-
-  return results;
+  return absoluteUrl(id);
 }
 
-function parseMainpageMangaBlocks(html) {
-  const results = [];
-
-  const re =
-    /<div class="media-left cover-manga">[\s\S]*?<a href="(\/manga\/[^"]+\/)"[^>]*>[\s\S]*?<img[^>]*(?:data-src|src)="([^"]+)"[\s\S]*?<h4 class="manga-newest">([^<]+)<\/h4>/gi;
-
-  let m;
-
-  while ((m = re.exec(html)) !== null) {
-    results.push({
-      href: m[1],
-      cover: m[2],
-      title: decodeEntities(m[3]),
-    });
-  }
-
-  return results;
-}
-
-async function parseCatalogCards(html) {
-  if (!html) return [];
-
-  let doc;
-
-  try {
-    doc = await harbor.parseHtml(html);
-  } catch (e) {
-    return [];
-  }
-
-  if (!doc) return [];
-
-  const anchors = doc.querySelectorAll('a[href^="/manga/"]');
-
-  const bySlug = new Map();
-
-  for (const a of anchors) {
-    const href = a.attr("href");
-
-    if (!href) continue;
-
-    const slug = slugFromMangaHref(href);
-
-    if (!slug) continue;
-
-    const text = cleanText(a.text());
-
-    const img = a.querySelector
-      ? a.querySelector("img")
-      : null;
-
-    let cover;
-
-    if (img) {
-      cover =
-        img.attr("data-src") ||
-        img.attr("data-lazy-src") ||
-        img.attr("src");
-    }
-
-    let item = bySlug.get(slug);
-
-    if (!item) {
-      item = {
-        href,
-        title: "",
-        cover: undefined,
-      };
-
-      bySlug.set(slug, item);
-    }
-
-    if (cover && !item.cover) {
-      item.cover = cover;
-    }
-
-    if (text && text.length > item.title.length) {
-      item.title = text;
-    }
-  }
-
-  return [...bySlug.values()].filter(
-    (x) => x.title && x.cover,
-  );
-}
-
-function dedupeCards(cards) {
-  const seen = new Set();
-  const result = [];
-
-  for (const card of cards) {
-    const slug = slugFromMangaHref(card.href);
-
-    if (!slug || seen.has(slug)) continue;
-
-    seen.add(slug);
-    result.push(card);
-  }
-
-  return result;
-}
-
-function cardsToResults(cards) {
-  return cards
-    .slice(0, PAGE_SIZE)
-    .map((card) => ({
-      id: card.href,
-      title: cleanText(card.title),
-      cover: absoluteUrl(card.cover),
-    }))
-    .filter((x) => x.id && x.title);
-}
-
-// ---------------------------------------------------------------------------
-// CATÁLOGO
-// ---------------------------------------------------------------------------
-
-function catalogPath({ tagId, page } = {}) {
-  const params = new URLSearchParams();
-
-  if (tagId) {
-    let type = "genre";
-    let value = tagId;
-
-    if (typeof tagId === "string" && tagId.includes(":")) {
-      const split = tagId.split(/:(.*)/s);
-
-      if (split[0] === "genre" || split[0] === "theme") {
-        type = split[0];
-        value = split[1];
-      }
-    }
-
-    params.set(type, value);
-  }
-
-  if (page && page > 1) {
-    params.set("page", String(page));
-  }
-
-  const query = params.toString();
-
-  return query
-    ? `/manga/?${query}`
-    : "/manga/?page=1";
-}
-
-// ---------------------------------------------------------------------------
-// EXTRAER META DE FICHA
-// ---------------------------------------------------------------------------
-
-function extractField(text, label) {
-  if (!text) return undefined;
-
-  const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-  const re = new RegExp(
-    `${escaped}\\s*:?\\s*(.*?)(?=\\s+(?:Títulos Alternativos|Géneros|Escribe|Estado|Tipo|Demografia|Capitulos|Vistas|Autor|Dibujo|Actualizado|Sinopsis)\\b|$)`,
-    "i",
-  );
-
-  const match = text.match(re);
-
-  return match ? cleanText(match[1]) : undefined;
-}
-
-function parseMangaDetail(html, id) {
-  if (!html) return null;
-
-  let doc = null;
-
-  try {
-    doc = harbor.parseHtml(html);
-  } catch (e) {
-    doc = null;
-  }
-
-  let title;
-  let cover;
-  let description;
-  let altTitle;
-  let status;
-  let author;
-
-  const genres = [];
-
-  if (doc) {
-    // -----------------------------------------------------------------------
-    // TÍTULO
-    // -----------------------------------------------------------------------
-
-    const h1 = doc.querySelector("h1");
-
-    if (h1) {
-      title = cleanText(h1.text());
-    }
-
-    // -----------------------------------------------------------------------
-    // PORTADA
-    // -----------------------------------------------------------------------
-
-    const ogImage = doc.querySelector(
-      'meta[property="og:image"]',
-    );
-
-    if (ogImage) {
-      cover =
-        ogImage.attr("content") ||
-        ogImage.attr("value");
-    }
-
-    if (!cover) {
-      const images = doc.querySelectorAll("img");
-
-      for (const img of images) {
-        const src =
-          img.attr("data-src") ||
-          img.attr("data-lazy-src") ||
-          img.attr("src");
-
-        if (!src) continue;
-
-        const alt = cleanText(
-          img.attr("alt") || "",
-        ).toLowerCase();
-
-        if (
-          alt.includes("portada") ||
-          alt.includes("cover") ||
-          !cover
-        ) {
-          cover = src;
-        }
-      }
-    }
-
-    // -----------------------------------------------------------------------
-    // BLOQUE DE DESCRIPCIÓN / METADATOS
-    // -----------------------------------------------------------------------
-
-    const body = doc.querySelector("body");
-
-    const bodyText = body
-      ? cleanText(body.text())
-      : "";
-
-    // Títulos alternativos
-    const altMatch = bodyText.match(
-      /Títulos Alternativos:\s*(.*?)(?=\s+Géneros:|\s+Escribe:|\s+Estado:|$)/i,
-    );
-
-    if (altMatch) {
-      altTitle = cleanText(altMatch[1]);
-    }
-
-    // Estado
-    const statusMatch = bodyText.match(
-      /Estado\s+([A-Za-zÁÉÍÓÚáéíóúÑñ]+)/i,
-    );
-
-    if (statusMatch) {
-      status = cleanText(statusMatch[1]).toLowerCase();
-    }
-
-    // Autor
-    const authorMatch = bodyText.match(
-      /Autor\s+(.+?)(?=\s+Dibujo\s+|\s+Actualizado\s+|\s+Sinopsis\s+|$)/i,
-    );
-
-    if (authorMatch) {
-      author = cleanText(authorMatch[1]);
-    }
-
-    // Géneros
-    const genreMatch = bodyText.match(
-      /Géneros:\s*(.*?)(?=\s+Escribe:|\s+Estado:|\s+Tipo:|$)/i,
-    );
-
-    if (genreMatch) {
-      genreMatch[1]
-        .split(",")
-        .map((x) => cleanText(x))
-        .filter(Boolean)
-        .forEach((x) => genres.push(x));
-    }
-
-    // Sinopsis
-    const headingNodes = doc.querySelectorAll("h2, h3");
-
-    for (const heading of headingNodes) {
-      const headingText = cleanText(
-        heading.text(),
-      ).toLowerCase();
-
-      if (
-        headingText === "sinopsis" ||
-        headingText.includes("sinopsis")
-      ) {
-        // Intentar encontrar el siguiente párrafo
-        const parent = heading.parent
-          ? heading.parent()
-          : null;
-
-        if (parent) {
-          const txt = cleanText(parent.text());
-
-          if (txt.length > 10) {
-            description = txt
-              .replace(/^sinopsis\s*/i, "")
-              .trim();
-          }
-        }
-      }
-    }
-
-    // Fallback: buscar el texto después de "Sinopsis"
-    if (!description) {
-      const synopsisMatch = bodyText.match(
-        /Sinopsis\s+(.+?)(?=\s+Lista Capítulos|\s+Capitulos|\s+Capítulos|$)/i,
-      );
-
-      if (synopsisMatch) {
-        description = cleanText(
-          synopsisMatch[1],
-        );
-      }
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // FALLBACK REGEX
-  // -------------------------------------------------------------------------
-
-  if (!title) {
-    const match = html.match(
-      /<h1[^>]*>([\s\S]*?)<\/h1>/i,
-    );
-
-    if (match) {
-      title = cleanText(
-        match[1].replace(/<[^>]+>/g, ""),
-      );
-    }
-  }
-
-  if (!cover) {
-    const match =
-      html.match(
-        /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)/i,
-      ) ||
-      html.match(
-        /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image/i,
-      );
-
-    if (match) {
-      cover = match[1];
-    }
-  }
-
-  return {
-    id,
-    title: title || id,
-    altTitle,
-    cover: absoluteUrl(cover),
-    description,
-    status,
-    author,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// CAPÍTULOS — ESTRUCTURA NUEVA
-// ---------------------------------------------------------------------------
-//
-// La ficha actual contiene enlaces como:
-//
-// /leer/5yt4bkltil/kubo-san-wa-boku-mobu-wo-yurusanai/148/
-//
-// Por eso ya no dependemos de .chapter-list.
-
-async function parseChaptersFromHtml(html) {
-  if (!html) return [];
-
-  let doc;
-
-  try {
-    doc = await harbor.parseHtml(html);
-  } catch (e) {
-    return [];
-  }
-
-  if (!doc) return [];
-
-  const anchors = doc.querySelectorAll(
-    'a[href*="/leer/"]',
-  );
-
-  const chapters = [];
-  const seen = new Set();
-
-  for (const a of anchors) {
-    const href = a.attr("href");
-
-    if (!href) continue;
-
-    const absolute = absoluteUrl(href);
-
-    if (!absolute || seen.has(absolute)) {
-      continue;
-    }
-
-    // Solo URLs reales de capítulos
-    const match = href.match(
-      /\/leer\/([^/]+)\/([^/]+)\/([^/?#]+)\/?$/i,
-    );
-
-    if (!match) continue;
-
-    const chapterNumber = decodeURIComponent(
-      match[3],
-    );
-
-    let text = cleanText(a.text());
-
-    // El HTML actual puede mostrar simplemente:
-    // "Capitulo 148"
-    if (!text) {
-      text = `Capitulo ${chapterNumber}`;
-    }
-
-    // Quitar fechas si aparecen en el texto
-    text = text
-      .replace(
-        /\s+\d{4}-\d{2}-\d{2}.*$/i,
-        "",
-      )
-      .trim();
-
-    chapters.push({
-      id: absolute,
-      chapter: chapterNumber || null,
-      title: text,
-      pages: 0,
-      language: "es",
-    });
-
-    seen.add(absolute);
-  }
-
-  // El sitio actualmente muestra primero los más recientes.
-  // No invertimos el orden porque queremos respetar el orden
-  // que presenta LeerCapítulo.
-  return chapters;
-}
-
-// ---------------------------------------------------------------------------
-// IMÁGENES DEL CAPÍTULO
-// ---------------------------------------------------------------------------
-
-async function parseImagesFromHtml(html) {
-  if (!html) return [];
-
-  let doc;
-
-  try {
-    doc = await harbor.parseHtml(html);
-  } catch (e) {
-    return [];
-  }
-
-  if (!doc) return [];
-
-  const images = doc.querySelectorAll("img");
-
-  const urls = [];
-  const seen = new Set();
-
-  for (const img of images) {
-    let src =
-      img.attr("src") ||
-      img.attr("data-src") ||
-      img.attr("data-lazy-src") ||
-      img.attr("data-original");
-
-    if (!src) continue;
-
-    src = absoluteUrl(src);
-
-    if (!src) continue;
-
-    // Evitar iconos/logos
-    const alt = cleanText(
-      img.attr("alt") || "",
-    ).toLowerCase();
-
-    if (
-      alt.includes("logo") ||
-      alt.includes("avatar") ||
-      alt.includes("icon")
-    ) {
-      continue;
-    }
-
-    // El CDN actual usa t34798ndc.com
-    // y las imágenes del lector son externas.
-    if (
-      !src.includes("t34798ndc.com") &&
-      !alt.includes("pagina") &&
-      !alt.includes("página") &&
-      !alt.includes("capitulo") &&
-      !alt.includes("capítulo")
-    ) {
-      continue;
-    }
-
-    if (seen.has(src)) continue;
-
-    seen.add(src);
-    urls.push(src);
-  }
-
-  return urls;
-}
-
-// ---------------------------------------------------------------------------
-// FALLBACK ARRAY_DATA
-// ---------------------------------------------------------------------------
+// ============================================================
+// Caché temporal
+// ============================================================
+
+const summaryCache = new Map();
+
+// ============================================================
+// Array data
+// ============================================================
 
 const K2_TO_K1 = new Map([
-  ["0", "w"], ["1", "j"], ["2", "H"], ["3", "A"],
-  ["4", "V"], ["5", "Q"], ["6", "P"], ["7", "3"],
-  ["8", "L"], ["9", "Y"], ["A", "m"], ["B", "t"],
-  ["C", "R"], ["D", "o"], ["E", "B"], ["F", "x"],
-  ["G", "T"], ["H", "C"], ["I", "N"], ["J", "0"],
-  ["K", "S"], ["L", "D"], ["M", "f"], ["N", "F"],
-  ["O", "y"], ["P", "h"], ["Q", "7"], ["R", "c"],
-  ["S", "s"], ["T", "d"], ["U", "9"], ["V", "e"],
-  ["W", "J"], ["X", "z"], ["Y", "X"], ["Z", "b"],
-  ["a", "a"], ["b", "I"], ["c", "q"], ["d", "G"],
-  ["e", "n"], ["f", "2"], ["g", "Z"], ["h", "M"],
-  ["i", "5"], ["j", "6"], ["k", "u"], ["l", "O"],
-  ["m", "i"], ["n", "l"], ["o", "g"], ["p", "r"],
-  ["q", "K"], ["r", "v"], ["s", "p"], ["t", "8"],
-  ["u", "4"], ["v", "U"], ["w", "W"], ["x", "E"],
-  ["y", "1"], ["z", "k"],
+  ["0", "w"],
+  ["1", "j"],
+  ["2", "H"],
+  ["3", "A"],
+  ["4", "V"],
+  ["5", "Q"],
+  ["6", "P"],
+  ["7", "3"],
+  ["8", "L"],
+  ["9", "Y"],
+  ["A", "m"],
+  ["B", "t"],
+  ["C", "R"],
+  ["D", "o"],
+  ["E", "B"],
+  ["F", "x"],
+  ["G", "T"],
+  ["H", "C"],
+  ["I", "N"],
+  ["J", "0"],
+  ["K", "S"],
+  ["L", "D"],
+  ["M", "f"],
+  ["N", "F"],
+  ["O", "y"],
+  ["P", "h"],
+  ["Q", "7"],
+  ["R", "c"],
+  ["S", "s"],
+  ["T", "d"],
+  ["U", "9"],
+  ["V", "e"],
+  ["W", "J"],
+  ["X", "z"],
+  ["Y", "X"],
+  ["Z", "b"],
+  ["a", "a"],
+  ["b", "I"],
+  ["c", "q"],
+  ["d", "G"],
+  ["e", "n"],
+  ["f", "2"],
+  ["g", "Z"],
+  ["h", "M"],
+  ["i", "5"],
+  ["j", "6"],
+  ["k", "u"],
+  ["l", "O"],
+  ["m", "i"],
+  ["n", "l"],
+  ["o", "g"],
+  ["p", "r"],
+  ["q", "K"],
+  ["r", "v"],
+  ["s", "p"],
+  ["t", "8"],
+  ["u", "4"],
+  ["v", "U"],
+  ["w", "W"],
+  ["x", "E"],
+  ["y", "1"],
+  ["z", "k"],
 ]);
 
 function decodeArrayData(arrayData) {
   if (!arrayData) return [];
 
-  const replaced = arrayData.replace(
+  const replaced = String(arrayData).replace(
     /[A-Za-z0-9]/g,
     (ch) => K2_TO_K1.get(ch) || ch,
   );
@@ -689,68 +203,834 @@ function decodeArrayData(arrayData) {
 
   try {
     decoded = atob(replaced);
-  } catch (e) {
+  } catch {
     return [];
   }
 
   return decoded
     .split(",")
     .map((x) => x.trim())
-    .filter(Boolean)
-    .map((x) => absoluteUrl(x))
     .filter(Boolean);
 }
 
-function parseArrayDataFallback(html) {
-  const match =
-    html.match(
-      /id=["']array_data["'][^>]*>([^<]+)</i,
-    ) ||
-    html.match(
-      /id=["']array_data["'][^>]*value=["']([^"']+)/i,
+// ============================================================
+// Parseo de tarjetas
+// ============================================================
+
+function parseHotMangaBlocks(html) {
+  if (!html) return [];
+
+  const results = [];
+
+  const regex =
+    /<[^>]*class=["'][^"']*hot-manga[^"']*["'][^>]*>[\s\S]*?<\/(?:div|article|li)>/gi;
+
+  const blocks = html.match(regex) || [];
+
+  for (const block of blocks) {
+    const hrefMatch = block.match(
+      /href=["']([^"']*\/manga\/[^"']*)["']/i,
     );
+
+    if (!hrefMatch) continue;
+
+    const id = absoluteUrl(hrefMatch[1]);
+    const slug = slugFromMangaHref(hrefMatch[1]);
+
+    if (!id || !slug) continue;
+
+    const titleMatch =
+      block.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i) ||
+      block.match(/<h4[^>]*>([\s\S]*?)<\/h4>/i) ||
+      block.match(/<a[^>]*>([\s\S]*?)<\/a>/i);
+
+    const imgMatch =
+      block.match(/data-src=["']([^"']+)["']/i) ||
+      block.match(/src=["']([^"']+)["']/i);
+
+    results.push({
+      id,
+      slug,
+      title: cleanText(titleMatch?.[1]) || slug,
+      cover: absoluteUrl(imgMatch?.[1]),
+    });
+  }
+
+  return results;
+}
+
+function parseMainpageMangaBlocks(html) {
+  if (!html) return [];
+
+  const results = [];
+
+  const regex =
+    /<[^>]*class=["'][^"']*(?:media-left|cover-manga)[^"']*["'][^>]*>[\s\S]*?<\/(?:div|article|li)>/gi;
+
+  const blocks = html.match(regex) || [];
+
+  for (const block of blocks) {
+    const hrefMatch = block.match(
+      /href=["']([^"']*\/manga\/[^"']*)["']/i,
+    );
+
+    if (!hrefMatch) continue;
+
+    const id = absoluteUrl(hrefMatch[1]);
+    const slug = slugFromMangaHref(hrefMatch[1]);
+
+    if (!id || !slug) continue;
+
+    const titleMatch =
+      block.match(/<h4[^>]*>([\s\S]*?)<\/h4>/i) ||
+      block.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i) ||
+      block.match(/<a[^>]*>([\s\S]*?)<\/a>/i);
+
+    const imgMatch =
+      block.match(/data-src=["']([^"']+)["']/i) ||
+      block.match(/src=["']([^"']+)["']/i);
+
+    results.push({
+      id,
+      slug,
+      title: cleanText(titleMatch?.[1]) || slug,
+      cover: absoluteUrl(imgMatch?.[1]),
+    });
+  }
+
+  return results;
+}
+
+async function parseCatalogCardsGeneric(html) {
+  if (!html) return [];
+
+  let doc;
+
+  try {
+    doc = await harbor.parseHtml(html);
+  } catch (e) {
+    harbor.log(`LeerCapitulo parseHtml error: ${e}`);
+    return [];
+  }
+
+  if (!doc) return [];
+
+  const anchors = doc.querySelectorAll('a[href*="/manga/"]');
+
+  const results = [];
+  const seen = new Set();
+
+  for (const a of anchors) {
+    const href = a.attr("href");
+
+    if (!href) continue;
+
+    const slug = slugFromMangaHref(href);
+
+    if (!slug || seen.has(slug)) continue;
+
+    let title = cleanText(a.text());
+
+    let cover;
+
+    try {
+      const img = a.querySelector("img");
+
+      if (img) {
+        cover =
+          img.attr("data-src") ||
+          img.attr("data-lazy-src") ||
+          img.attr("src") ||
+          undefined;
+      }
+    } catch {}
+
+    // Buscar una imagen dentro del contenedor padre si el <a>
+    // no contiene directamente la imagen.
+    if (!cover) {
+      try {
+        const parent = a.parent();
+
+        if (parent) {
+          const img = parent.querySelector("img");
+
+          if (img) {
+            cover =
+              img.attr("data-src") ||
+              img.attr("data-lazy-src") ||
+              img.attr("src") ||
+              undefined;
+          }
+        }
+      } catch {}
+    }
+
+    if (!title) {
+      try {
+        const parent = a.parent();
+        if (parent) title = cleanText(parent.text());
+      } catch {}
+    }
+
+    if (!title) title = slug;
+
+    const id = absoluteUrl(href);
+
+    seen.add(slug);
+
+    results.push({
+      id,
+      slug,
+      title,
+      cover: absoluteUrl(cover),
+    });
+  }
+
+  return results;
+}
+
+function dedupeCardsBySlug(cards) {
+  const seen = new Set();
+  const result = [];
+
+  for (const card of cards) {
+    if (!card || !card.slug) continue;
+
+    if (seen.has(card.slug)) continue;
+
+    seen.add(card.slug);
+    result.push(card);
+  }
+
+  return result;
+}
+
+function cardsToResults(cards) {
+  return cards.map((card) => {
+    const result = {
+      id: card.id,
+      title: card.title || card.slug,
+      cover: card.cover,
+    };
+
+    summaryCache.set(result.id, result);
+
+    return result;
+  });
+}
+
+// ============================================================
+// Catálogo
+// ============================================================
+
+function catalogPath({ tagId, page } = {}) {
+  let path = "/manga/?";
+
+  if (tagId) {
+    if (tagId.startsWith("genre:")) {
+      path += `genre=${encodeURIComponent(tagId.slice(6))}`;
+    } else if (tagId.startsWith("theme:")) {
+      path += `theme=${encodeURIComponent(tagId.slice(6))}`;
+    }
+  }
+
+  const separator = path.endsWith("?") ? "" : "&";
+
+  path += `${separator}page=${page || 1}`;
+
+  return path;
+}
+
+// ============================================================
+// Detail
+// ============================================================
+
+function extractMeta(html, property) {
+  const regex = new RegExp(
+    `<meta[^>]+(?:property|name)=["']${property.replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&",
+    )}["'][^>]+content=["']([^"']*)["'][^>]*>`,
+    "i",
+  );
+
+  return regex.exec(html)?.[1] || undefined;
+}
+
+function extractFirstImage(html) {
+  if (!html) return undefined;
+
+  const preferredPatterns = [
+    /<img[^>]+class=["'][^"']*(?:cover|manga)[^"']*["'][^>]+(?:src|data-src|data-lazy-src)=["']([^"']+)["']/i,
+    /<img[^>]+(?:src|data-src|data-lazy-src)=["']([^"']+)["'][^>]+class=["'][^"']*(?:cover|manga)[^"']*["']/i,
+    /<div[^>]+class=["'][^"']*(?:cover-detail|cover-manga)[^"']*["'][^>]*>[\s\S]*?<img[^>]+(?:src|data-src|data-lazy-src)=["']([^"']+)["']/i,
+  ];
+
+  for (const regex of preferredPatterns) {
+    const match = html.match(regex);
+
+    if (match?.[1]) {
+      return absoluteUrl(match[1]);
+    }
+  }
+
+  // OpenGraph suele ser una fuente bastante fiable.
+  const ogImage =
+    extractMeta(html, "og:image") ||
+    extractMeta(html, "twitter:image");
+
+  if (ogImage) {
+    return absoluteUrl(ogImage);
+  }
+
+  // Último recurso: buscar imágenes que no parezcan iconos/logos.
+  const images = [
+    ...html.matchAll(
+      /<img[^>]+(?:src|data-src|data-lazy-src)=["']([^"']+)["'][^>]*>/gi,
+    ),
+  ];
+
+  for (const match of images) {
+    const url = match[1];
+
+    if (!url) continue;
+
+    const lower = url.toLowerCase();
+
+    if (
+      lower.includes("logo") ||
+      lower.includes("icon") ||
+      lower.includes("avatar") ||
+      lower.includes("favicon") ||
+      lower.includes("ads")
+    ) {
+      continue;
+    }
+
+    return absoluteUrl(url);
+  }
+
+  return undefined;
+}
+
+function extractTitle(html, fallback) {
+  if (!html) return fallback;
+
+  const patterns = [
+    /<h1[^>]*class=["'][^"']*title-manga[^"']*["'][^>]*>([\s\S]*?)<\/h1>/i,
+    /<h1[^>]*class=["'][^"']*manga-title[^"']*["'][^>]*>([\s\S]*?)<\/h1>/i,
+    /<h1[^>]*>([\s\S]*?)<\/h1>/i,
+  ];
+
+  for (const regex of patterns) {
+    const match = html.match(regex);
+
+    if (match?.[1]) {
+      const title = cleanText(match[1]);
+
+      if (
+        title &&
+        title.toLowerCase() !== "untitled" &&
+        title.toLowerCase() !== "undefined"
+      ) {
+        return title;
+      }
+    }
+  }
+
+  const ogTitle =
+    extractMeta(html, "og:title") ||
+    extractMeta(html, "twitter:title");
+
+  if (ogTitle) {
+    const title = cleanText(ogTitle);
+
+    if (
+      title &&
+      title.toLowerCase() !== "untitled" &&
+      title.toLowerCase() !== "undefined"
+    ) {
+      return title;
+    }
+  }
+
+  const titleTag = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+
+  if (titleTag?.[1]) {
+    let title = cleanText(titleTag[1]);
+
+    title = title
+      .replace(/\s*[|–—-]\s*LeerCapitulo.*$/i, "")
+      .replace(/\s*[|–—-]\s*Leer Capitulo.*$/i, "")
+      .trim();
+
+    if (
+      title &&
+      title.toLowerCase() !== "untitled" &&
+      title.toLowerCase() !== "undefined"
+    ) {
+      return title;
+    }
+  }
+
+  return fallback;
+}
+
+function extractDescription(html) {
+  const patterns = [
+    /<p[^>]+id=["']example2["'][^>]*>([\s\S]*?)<\/p>/i,
+    /<p[^>]+class=["'][^"']*description[^"']*["'][^>]*>([\s\S]*?)<\/p>/i,
+    /<div[^>]+class=["'][^"']*description[^"']*["'][^>]*>([\s\S]*?)<\/div>/i,
+  ];
+
+  for (const regex of patterns) {
+    const match = html.match(regex);
+
+    if (match?.[1]) {
+      const value = cleanText(match[1]);
+
+      if (value) return value;
+    }
+  }
+
+  const metaDescription =
+    extractMeta(html, "description") ||
+    extractMeta(html, "og:description");
+
+  return metaDescription ? cleanText(metaDescription) : undefined;
+}
+
+function extractAlternateTitles(html) {
+  if (!html) return undefined;
+
+  const match = html.match(
+    /Títulos\s+Alternativos\s*:\s*<\/span>\s*([\s\S]*?)(?:<br\s*\/?>|<\/p>)/i,
+  );
+
+  if (!match) return undefined;
+
+  const value = cleanText(match[1]);
+
+  return value || undefined;
+}
+
+function extractGenres(html) {
+  if (!html) return [];
+
+  const match = html.match(
+    /Géneros\s*:\s*<\/span>\s*([\s\S]*?)(?:<br\s*\/?>|<\/p>)/i,
+  );
 
   if (!match) return [];
 
-  return decodeArrayData(
-    cleanText(match[1]),
-  );
+  return [
+    ...match[1].matchAll(/<a[^>]*>([\s\S]*?)<\/a>/gi),
+  ]
+    .map((m) => cleanText(m[1]))
+    .filter(Boolean);
 }
 
-// ---------------------------------------------------------------------------
-// PROVIDER
-// ---------------------------------------------------------------------------
+function extractStatus(html) {
+  if (!html) return undefined;
+
+  const match = html.match(
+    /Estado\s*:\s*<\/span>\s*([^<]+)(?:<br\s*\/?>|<\/p>)/i,
+  );
+
+  if (!match) return undefined;
+
+  const value = cleanText(match[1]);
+
+  return value ? value.toLowerCase() : undefined;
+}
+
+// ============================================================
+// Capítulos
+// ============================================================
+
+function chapterNumberFromUrl(url) {
+  if (!url) return null;
+
+  const parts = String(url)
+    .split("/")
+    .filter(Boolean);
+
+  if (!parts.length) return null;
+
+  return parts[parts.length - 1] || null;
+}
+
+function cleanChapterTitle(text, number) {
+  let title = cleanText(text);
+
+  if (!title) {
+    return number ? `Capítulo ${number}` : "";
+  }
+
+  // Elimina fechas habituales.
+  title = title
+    .replace(
+      /\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b/g,
+      "",
+    )
+    .replace(
+      /\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b/g,
+      "",
+    )
+    .replace(
+      /\b\d{1,2}:\d{2}(?::\d{2})?\b/g,
+      "",
+    );
+
+  // Elimina etiquetas típicas de fecha.
+  title = title
+    .replace(
+      /\b(?:publicado|publicada|actualizado|actualizada|fecha)\s*:?\s*/gi,
+      "",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Si después de eliminar la fecha no queda nada útil,
+  // utilizamos el número real del capítulo.
+  if (!title) {
+    return number ? `Capítulo ${number}` : "";
+  }
+
+  // Si el texto restante es prácticamente solo un número,
+  // convertirlo en nombre de capítulo.
+  if (/^#?\s*\d+(?:\.\d+)?$/.test(title)) {
+    return `Capítulo ${title.replace(/^#/, "").trim()}`;
+  }
+
+  // Si contiene un número de capítulo explícito, mantenerlo.
+  if (
+    /^cap(?:ítulo|itulo)?\s*\.?\s*\d+/i.test(title) ||
+    /^chapter\s+\d+/i.test(title)
+  ) {
+    return title;
+  }
+
+  return title;
+}
+
+function extractChapterFromAnchor(a) {
+  if (!a) return null;
+
+  const href = a.attr("href");
+
+  if (!href) return null;
+
+  if (!/\/leer\//i.test(href)) return null;
+
+  const id = absoluteUrl(href);
+
+  if (!id) return null;
+
+  const number = chapterNumberFromUrl(href);
+
+  let title = "";
+
+  // Primero buscar elementos internos que normalmente contienen
+  // únicamente el nombre del capítulo.
+  const selectors = [
+    ".chapter-title",
+    ".chapter-name",
+    ".chapter-link-title",
+    ".title",
+    ".name",
+    "span",
+    "strong",
+    "b",
+  ];
+
+  for (const selector of selectors) {
+    try {
+      const node = a.querySelector(selector);
+
+      if (node) {
+        const value = cleanText(node.text());
+
+        if (value) {
+          title = value;
+          break;
+        }
+      }
+    } catch {}
+  }
+
+  if (!title) {
+    title = cleanText(a.text());
+  }
+
+  title = cleanChapterTitle(title, number);
+
+  return {
+    id,
+    chapter: number,
+    title,
+    pages: 0,
+    language: "es",
+  };
+}
+
+async function parseChaptersFromHtml(html) {
+  if (!html) {
+    return {
+      chapters: [],
+      nextUrls: [],
+    };
+  }
+
+  let doc;
+
+  try {
+    doc = await harbor.parseHtml(html);
+  } catch {
+    doc = null;
+  }
+
+  const chapters = [];
+  const seen = new Set();
+  const nextUrls = [];
+
+  if (doc) {
+    const anchors = doc.querySelectorAll('a[href*="/leer/"]');
+
+    for (const a of anchors) {
+      const chapter = extractChapterFromAnchor(a);
+
+      if (!chapter) continue;
+
+      if (seen.has(chapter.id)) continue;
+
+      seen.add(chapter.id);
+      chapters.push(chapter);
+    }
+
+    // Buscar paginación.
+    const paginationSelectors = [
+      'a[href*="before="]',
+      'a[href*="page="]',
+      'a[rel="next"]',
+      'a.next',
+      'a.more',
+      'a.load-more',
+    ];
+
+    for (const selector of paginationSelectors) {
+      try {
+        const links = doc.querySelectorAll(selector);
+
+        for (const link of links) {
+          const href = link.attr("href");
+
+          if (!href) continue;
+
+          const text = cleanText(link.text()).toLowerCase();
+
+          if (
+            href.includes("before=") ||
+            href.includes("page=") ||
+            link.attr("rel") === "next" ||
+            /siguiente|más|mas|anteriores|cargar/.test(text)
+          ) {
+            const url = absoluteUrl(href);
+
+            if (url && !nextUrls.includes(url)) {
+              nextUrls.push(url);
+            }
+          }
+        }
+      } catch {}
+    }
+  }
+
+  // Fallback regex por si el parser no encuentra los enlaces.
+  if (!chapters.length) {
+    const matches = [
+      ...html.matchAll(
+        /<a[^>]+href=["']([^"']*\/leer\/[^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi,
+      ),
+    ];
+
+    for (const match of matches) {
+      const href = match[1];
+      const id = absoluteUrl(href);
+
+      if (!id || seen.has(id)) continue;
+
+      const number = chapterNumberFromUrl(href);
+      const title = cleanChapterTitle(match[2], number);
+
+      seen.add(id);
+
+      chapters.push({
+        id,
+        chapter: number,
+        title,
+        pages: 0,
+        language: "es",
+      });
+    }
+  }
+
+  return {
+    chapters,
+    nextUrls,
+  };
+}
+
+// ============================================================
+// Páginas del capítulo
+// ============================================================
+
+function isLikelyMangaImage(url) {
+  if (!url) return false;
+
+  const lower = String(url).toLowerCase();
+
+  if (
+    lower.includes("logo") ||
+    lower.includes("icon") ||
+    lower.includes("favicon") ||
+    lower.includes("avatar") ||
+    lower.includes("banner") ||
+    lower.includes("background") ||
+    lower.includes("ads")
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+async function pageUrlsFromImages(html) {
+  if (!html) return [];
+
+  let doc;
+
+  try {
+    doc = await harbor.parseHtml(html);
+  } catch {
+    doc = null;
+  }
+
+  const urls = [];
+  const seen = new Set();
+
+  if (doc) {
+    const selectors = [
+      "#cascade-view img",
+      "img.manga-image",
+      "img[class*='manga']",
+      "img[class*='chapter']",
+      ".reader img",
+      ".reading-content img",
+    ];
+
+    for (const selector of selectors) {
+      try {
+        const images = doc.querySelectorAll(selector);
+
+        for (const img of images) {
+          const src =
+            img.attr("data-src") ||
+            img.attr("data-lazy-src") ||
+            img.attr("data-original") ||
+            img.attr("src");
+
+          const url = absoluteUrl(src);
+
+          if (!url || !isLikelyMangaImage(url)) continue;
+
+          if (seen.has(url)) continue;
+
+          seen.add(url);
+          urls.push(url);
+        }
+      } catch {}
+    }
+
+    if (urls.length) return urls;
+
+    // Último recurso: todas las imágenes de la página.
+    try {
+      const images = doc.querySelectorAll("img");
+
+      for (const img of images) {
+        const src =
+          img.attr("data-src") ||
+          img.attr("data-lazy-src") ||
+          img.attr("data-original") ||
+          img.attr("src");
+
+        const url = absoluteUrl(src);
+
+        if (!url || !isLikelyMangaImage(url)) continue;
+
+        if (seen.has(url)) continue;
+
+        seen.add(url);
+        urls.push(url);
+      }
+    } catch {}
+  }
+
+  return urls;
+}
+
+// ============================================================
+// Provider
+// ============================================================
 
 const plugin = {
   id: "leercapitulo",
-
   name: "LeerCapitulo",
 
-  // -------------------------------------------------------------------------
-  // POPULAR
-  // -------------------------------------------------------------------------
+  // ----------------------------------------------------------
+  // Popular / recientes
+  // ----------------------------------------------------------
 
   async popular(offset, tagId) {
     if (tagId) {
       return this._byGenre(tagId, offset);
     }
 
+    // La portada tiene prioridad sobre /manga/.
+    // Esto evita que Harbor termine mostrando el orden
+    // alfabético/catalogado cuando la portada cambia.
     if (offset === 0) {
       const html = await fetchText("/");
 
       if (html) {
-        const cards = dedupeCards([
+        let cards = [];
+
+        cards = dedupeCardsBySlug([
           ...parseHotMangaBlocks(html),
           ...parseMainpageMangaBlocks(html),
         ]);
 
-        if (cards.length > 0) {
-          return cardsToResults(cards);
+        if (cards.length < PAGE_SIZE) {
+          const generic = await parseCatalogCardsGeneric(html);
+
+          cards = dedupeCardsBySlug([
+            ...cards,
+            ...generic,
+          ]);
+        }
+
+        if (cards.length) {
+          return cardsToResults(
+            cards.slice(0, PAGE_SIZE),
+          );
         }
       }
     }
 
-    const page = pageFromOffset(offset);
+    // Para páginas posteriores usamos el catálogo.
+    const page =
+      Math.floor(offset / PAGE_SIZE) + 1;
 
     const html = await fetchText(
       catalogPath({ page }),
@@ -758,17 +1038,15 @@ const plugin = {
 
     if (!html) return [];
 
-    const cards = await parseCatalogCards(html);
+    const cards =
+      await parseCatalogCardsGeneric(html);
 
     return cardsToResults(cards);
   },
 
-  // -------------------------------------------------------------------------
-  // FILTROS
-  // -------------------------------------------------------------------------
-
   async _byGenre(tagId, offset) {
-    const page = pageFromOffset(offset);
+    const page =
+      Math.floor(offset / PAGE_SIZE) + 1;
 
     const html = await fetchText(
       catalogPath({
@@ -779,14 +1057,15 @@ const plugin = {
 
     if (!html) return [];
 
-    const cards = await parseCatalogCards(html);
+    const cards =
+      await parseCatalogCardsGeneric(html);
 
     return cardsToResults(cards);
   },
 
-  // -------------------------------------------------------------------------
-  // BUSCAR
-  // -------------------------------------------------------------------------
+  // ----------------------------------------------------------
+  // Search
+  // ----------------------------------------------------------
 
   async search(query, offset, tagId) {
     if (!query && tagId) {
@@ -796,9 +1075,7 @@ const plugin = {
     if (!query) return [];
 
     const json = await fetchJson(
-      `/search-autocomplete?term=${encodeURIComponent(
-        query,
-      )}`,
+      `/search-autocomplete?term=${encodeURIComponent(query)}`,
     );
 
     if (!Array.isArray(json)) {
@@ -810,157 +1087,303 @@ const plugin = {
       offset + PAGE_SIZE,
     );
 
-    return page
-      .map((serie) => {
-        if (!serie) return null;
+    const results = [];
 
-        const link =
-          serie.link ||
-          serie.url ||
-          serie.href;
+    for (const serie of page) {
+      if (!serie) continue;
 
-        const title =
-          serie.label ||
-          serie.title ||
-          serie.name;
+      const id = normalizeId(serie.link);
 
-        const thumbnail =
-          serie.thumbnail ||
-          serie.cover ||
-          serie.image;
+      if (!id) continue;
 
-        if (!link || !title) {
-          return null;
+      const result = {
+        id,
+        title:
+          cleanText(serie.label) ||
+          "Untitled",
+        cover: absoluteUrl(
+          serie.thumbnail,
+        ),
+      };
+
+      // Obtener títulos alternativos cuando hay pocos
+      // resultados, igual que hacía la versión anterior.
+      if (json.length <= 6 && serie.link) {
+        const html = await fetchText(serie.link);
+
+        if (html) {
+          const altTitle = extractAlternateTitles(html);
+
+          if (altTitle) {
+            result.altTitle = altTitle;
+          }
         }
+      }
 
-        return {
-          id: absoluteUrl(link) || link,
-          title: cleanText(title),
-          cover: absoluteUrl(thumbnail),
-        };
-      })
-      .filter(Boolean);
+      summaryCache.set(id, result);
+
+      results.push(result);
+    }
+
+    return results;
   },
 
-  // -------------------------------------------------------------------------
-  // DETALLE
-  // -------------------------------------------------------------------------
+  // ----------------------------------------------------------
+  // Detail
+  // ----------------------------------------------------------
 
   async detail(id) {
-    if (!id) return null;
+    const normalizedId = normalizeId(id);
 
-    const html = await fetchText(id);
+    if (!normalizedId) return null;
 
+    const cached = summaryCache.get(normalizedId);
+
+    const html = await fetchText(normalizedId);
+
+    // Incluso si la página falla, devolver lo que sabemos
+    // desde search.
     if (!html) {
-      harbor.log(`DETAIL EMPTY: ${id}`);
+      if (cached) {
+        return {
+          ...cached,
+        };
+      }
+
       return null;
     }
 
-    const manga = parseMangaDetail(
+    const title = extractTitle(
       html,
-      id,
+      cached?.title || "Untitled",
     );
 
-    if (!manga) {
-      return null;
+    const cover =
+      extractFirstImage(html) ||
+      cached?.cover;
+
+    const description =
+      extractDescription(html);
+
+    const altTitle =
+      extractAlternateTitles(html) ||
+      cached?.altTitle;
+
+    const genres = extractGenres(html);
+    const status = extractStatus(html);
+
+    let chapters = [];
+
+    try {
+      chapters = await this.chapters(
+        normalizedId,
+        html,
+      );
+    } catch (e) {
+      harbor.log(
+        `LeerCapitulo detail chapters error: ${e}`,
+      );
     }
 
-    // Intentar averiguar el último capítulo.
-    const chapters =
-      await parseChaptersFromHtml(html);
+    const lastChapter =
+      chapters.length > 0
+        ? chapters[chapters.length - 1].chapter
+        : undefined;
 
-    if (chapters.length > 0) {
-      manga.lastChapter =
-        chapters[0].chapter || undefined;
-    }
+    const result = {
+      id: normalizedId,
+      title:
+        title &&
+        title.toLowerCase() !== "untitled"
+          ? title
+          : cached?.title || "Untitled",
+      altTitle,
+      cover,
+      description,
+      status,
+      lastChapter,
+    };
 
-    return manga;
+    summaryCache.set(normalizedId, {
+      id: result.id,
+      title: result.title,
+      altTitle: result.altTitle,
+      cover: result.cover,
+    });
+
+    return result;
   },
 
-  // -------------------------------------------------------------------------
-  // CAPÍTULOS
-  // -------------------------------------------------------------------------
+  // ----------------------------------------------------------
+  // Chapters
+  // ----------------------------------------------------------
 
-  async chapters(id) {
-    if (!id) return [];
+  async chapters(id, cachedHtml) {
+    let html =
+      cachedHtml ||
+      (await fetchText(id));
 
-    const html = await fetchText(id);
+    if (!html) return [];
 
-    if (!html) {
-      harbor.log(`CHAPTERS EMPTY: ${id}`);
-      return [];
+    const allChapters = [];
+    const seen = new Set();
+    const visitedPages = new Set();
+
+    let currentUrl = normalizeId(id);
+    let firstPage = true;
+
+    // Procesamos varias páginas si LeerCapitulo usa
+    // paginación para los capítulos.
+    for (let iteration = 0; iteration < 50; iteration++) {
+      if (!html) break;
+
+      if (currentUrl && visitedPages.has(currentUrl)) {
+        break;
+      }
+
+      if (currentUrl) {
+        visitedPages.add(currentUrl);
+      }
+
+      const parsed =
+        await parseChaptersFromHtml(html);
+
+      for (const chapter of parsed.chapters) {
+        if (!chapter?.id) continue;
+
+        if (seen.has(chapter.id)) continue;
+
+        seen.add(chapter.id);
+        allChapters.push(chapter);
+      }
+
+      let nextUrl = null;
+
+      // Preferimos enlaces before= porque normalmente significan
+      // capítulos anteriores.
+      const beforeLink =
+        parsed.nextUrls.find((url) =>
+          url.includes("before="),
+        );
+
+      if (beforeLink) {
+        nextUrl = beforeLink;
+      } else if (parsed.nextUrls.length) {
+        nextUrl = parsed.nextUrls[0];
+      }
+
+      if (!nextUrl) break;
+
+      if (visitedPages.has(nextUrl)) break;
+
+      currentUrl = nextUrl;
+      html = await fetchText(nextUrl);
+
+      firstPage = false;
     }
 
-    const chapters =
-      await parseChaptersFromHtml(html);
+    // Orden numérico ascendente.
+    allChapters.sort((a, b) => {
+      const na = parseFloat(a.chapter);
+      const nb = parseFloat(b.chapter);
 
-    harbor.log(
-      `CHAPTERS ${id}: ${chapters.length}`,
-    );
+      if (!Number.isNaN(na) && !Number.isNaN(nb)) {
+        return na - nb;
+      }
 
-    return chapters;
+      return String(a.chapter || "").localeCompare(
+        String(b.chapter || ""),
+        undefined,
+        {
+          numeric: true,
+          sensitivity: "base",
+        },
+      );
+    });
+
+    return allChapters;
   },
 
-  // -------------------------------------------------------------------------
-  // PÁGINAS
-  // -------------------------------------------------------------------------
+  // ----------------------------------------------------------
+  // Page URLs
+  // ----------------------------------------------------------
 
   async pageUrls(chapterId) {
-    if (!chapterId) return [];
+    const html = await fetchText(chapterId);
 
-    const html = await fetchText(
-      chapterId,
+    if (!html) return [];
+
+    // Primero intentamos las imágenes reales del lector.
+    const imageUrls =
+      await pageUrlsFromImages(html);
+
+    if (imageUrls.length) {
+      return imageUrls;
+    }
+
+    // Fallback antiguo: array_data.
+    const arrayDataMatch = html.match(
+      /id=["']array_data["'][^>]*>([^<]+)</i,
     );
 
-    if (!html) {
-      harbor.log(
-        `PAGES EMPTY: ${chapterId}`,
-      );
+    const arrayData = (
+      arrayDataMatch?.[1] || ""
+    ).trim();
 
+    const urlList =
+      decodeArrayData(arrayData);
+
+    if (!urlList.length) {
       return [];
     }
 
-    // PRIMER MÉTODO:
-    // HTML actual de LeerCapítulo.
-    //
-    // Las páginas aparecen directamente como imágenes
-    // dentro del lector.
-
-    const images =
-      await parseImagesFromHtml(html);
-
-    if (images.length > 0) {
-      harbor.log(
-        `PAGES IMG: ${images.length}`,
+    const orderMetaMatch =
+      html.match(
+        /property=["']ad:check["'][^>]+content=["']([^"']+)["']/i,
       );
 
-      return images;
+    const orderRaw =
+      orderMetaMatch?.[1] || null;
+
+    if (!orderRaw) {
+      return urlList
+        .map(absoluteUrl)
+        .filter(Boolean);
     }
 
-    // SEGUNDO MÉTODO:
-    // Compatibilidad con el lector antiguo.
+    const orderList = orderRaw
+      .replace(/[^\d]+/g, "-")
+      .split("-")
+      .filter(Boolean);
 
-    const fallback =
-      parseArrayDataFallback(html);
+    const useReversed =
+      orderList.some((x) => x === "01");
 
-    if (fallback.length > 0) {
-      harbor.log(
-        `PAGES ARRAY_DATA: ${fallback.length}`,
-      );
+    const result = orderList
+      .map((value) => {
+        let index = parseInt(value, 10);
 
-      return fallback;
-    }
+        if (useReversed) {
+          index = parseInt(
+            value
+              .split("")
+              .reverse()
+              .join(""),
+            10,
+          );
+        }
 
-    harbor.log(
-      `PAGES NOT FOUND: ${chapterId}`,
-    );
+        return urlList[index];
+      })
+      .map(absoluteUrl)
+      .filter(Boolean);
 
-    return [];
+    return result.reverse();
   },
 
-  // -------------------------------------------------------------------------
-  // TAGS
-  // -------------------------------------------------------------------------
+  // ----------------------------------------------------------
+  // Tags
+  // ----------------------------------------------------------
 
   async tags() {
     const html = await fetchText("/");
@@ -971,7 +1394,7 @@ const plugin = {
 
     try {
       doc = await harbor.parseHtml(html);
-    } catch (e) {
+    } catch {
       return [];
     }
 
@@ -991,10 +1414,10 @@ const plugin = {
       if (!href || !name) continue;
 
       const genreMatch =
-        href.match(/[?&]genre=([^&]+)/i);
+        href.match(/[?&]genre=([^&]+)/);
 
       const themeMatch =
-        href.match(/[?&]theme=([^&]+)/i);
+        href.match(/[?&]theme=([^&]+)/);
 
       let id;
 
