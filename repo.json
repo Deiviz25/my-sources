@@ -30,13 +30,13 @@
       "entry": "novelcool.plugin.js"
     },
     {
-      "id": "mangadot",
-      "name": "MangaDot",
-      "version": "1.1.9",
-      "lang": "en",
+      "id": "mangadotnet",
+      "name": "MangaDotNet",
+      "version": "1.0.0",
+      "lang": "es",
       "nsfw": false,
-      "icon": "https://mangadot.net/mangadotnet-purple.svg",
-      "entry": "mangadot.plugin.js"
+      "icon": "https://mangadot.net/favicon.ico",
+      "entry": "mangadotnet.plugin.js"
     },
     {
       "id": "comix",
