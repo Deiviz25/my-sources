@@ -13,17 +13,12 @@ async function fetchText(path) {
     let url = path;
 
     if (!/^https?:\/\//i.test(url)) {
-      url = new URL(
-        String(path).replace(/^\/+/, "/"),
-        BASE_URL + "/"
-      ).toString();
+      url = new URL(String(path).replace(/^\/+/, "/"), BASE_URL + "/").toString();
     }
 
     const res = await harbor.http(url, {
       responseType: "text",
-      headers: {
-        "user-agent": DESKTOP_UA,
-      },
+      headers: { "user-agent": DESKTOP_UA },
     });
 
     return res?.body || null;
@@ -37,9 +32,7 @@ async function fetchJson(url) {
   try {
     const res = await harbor.http(url, {
       responseType: "json",
-      headers: {
-        "user-agent": DESKTOP_UA,
-      },
+      headers: { "user-agent": DESKTOP_UA },
     });
 
     return res?.body ?? res ?? null;
@@ -71,16 +64,13 @@ function decodeEntities(value) {
     .replace(/&amp;/gi, "&")
     .replace(/&quot;/gi, '"')
     .replace(/&#39;/gi, "'")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
     .replace(/&#x27;/gi, "'")
     .replace(/&#x2F;/gi, "/")
-    .replace(/&#(\d+);/g, (_, n) => {
-      try {
-        return String.fromCharCode(Number(n));
-      } catch {
-        return _;
-      }
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&#(\d+);/g, (match, n) => {
+      const code = Number(n);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : match;
     });
 }
 
@@ -99,21 +89,15 @@ function cleanText(value) {
 /* =========================================================
  * MANGA ID
  *
- * Los mangas reales tienen URLs como:
- *
- * /manga/byywymjdxc/u-dont-know-me/
- *
- * Por eso guardamos los dos segmentos juntos:
- *
- * byywymjdxc/u-dont-know-me
+ * Las URLs reales son del tipo:
+ *   /manga/byywymjdxc/u-dont-know-me/
+ * Guardamos los dos segmentos juntos: "byywymjdxc/u-dont-know-me"
  * ========================================================= */
 
 function slugFromMangaHref(href) {
   if (!href) return null;
 
-  const match = String(href).match(
-    /\/manga\/([^?#]+?)\/?(?:[?#]|$)/i
-  );
+  const match = String(href).match(/\/manga\/([^?#]+?)\/?(?:[?#]|$)/i);
 
   if (!match || !match[1]) return null;
 
@@ -133,90 +117,31 @@ function decodeMangaId(id) {
 }
 
 /*
- * Convierte cualquier representación del manga
- * en su URL real.
- *
- * Acepta:
- *
- * byywymjdxc/u-dont-know-me
- *
- * /manga/byywymjdxc/u-dont-know-me/
- *
- * https://www.leercapitulo.co/manga/byywymjdxc/u-dont-know-me/
+ * Convierte cualquier representación del manga en su URL real.
+ * Acepta: "byywymjdxc/u-dont-know-me", "/manga/…/", o una URL completa.
  */
 function mangaUrlFromId(id) {
   if (!id) return null;
 
-  const value = String(id).trim();
+  const value = decodeMangaId(String(id).trim()).trim();
 
-  if (/^https?:\/\//i.test(value)) {
-    return value;
-  }
+  if (/^https?:\/\//i.test(value)) return value;
 
-  if (/^\/manga\//i.test(value)) {
-    return absoluteUrl(value);
-  }
+  if (/^\/manga\//i.test(value)) return absoluteUrl(value);
 
-  const decoded = decodeMangaId(value).trim();
-
-  if (/^https?:\/\//i.test(decoded)) {
-    return decoded;
-  }
-
-  if (/^\/manga\//i.test(decoded)) {
-    return absoluteUrl(decoded);
-  }
-
-  return `${BASE_URL}/manga/${decoded.replace(
-    /^\/+|\/+$/g,
-    ""
-  )}/`;
+  return `${BASE_URL}/manga/${value.replace(/^\/+|\/+$/g, "")}/`;
 }
 
 /* =========================================================
- * ARRAY DATA
+ * ARRAY DATA (cifrado de páginas del lector)
  * ========================================================= */
 
 const K2_TO_K1 = {
-  "Z": "0",
-  "p": "1",
-  "Q": "2",
-  "x": "3",
-  "R": "4",
-  "m": "5",
-  "V": "6",
-  "a": "7",
-  "N": "8",
-  "k": "9",
-  "b": "A",
-  "T": "B",
-  "w": "C",
-  "c": "D",
-  "L": "E",
-  "d": "F",
-  "Y": "G",
-  "f": "H",
-  "U": "I",
-  "h": "J",
-  "i": "K",
-  "O": "L",
-  "j": "M",
-  "K": "N",
-  "l": "O",
-  "M": "P",
-  "n": "Q",
-  "P": "R",
-  "q": "S",
-  "H": "T",
-  "r": "U",
-  "S": "V",
-  "t": "W",
-  "u": "X",
-  "I": "Y",
-  "v": "Z",
-  "+": "+",
-  "/": "/",
-  "=": "=",
+  Z: "0", p: "1", Q: "2", x: "3", R: "4", m: "5", V: "6", a: "7", N: "8", k: "9",
+  b: "A", T: "B", w: "C", c: "D", L: "E", d: "F", Y: "G", f: "H", U: "I", h: "J",
+  i: "K", O: "L", j: "M", K: "N", l: "O", M: "P", n: "Q", P: "R", q: "S", H: "T",
+  r: "U", S: "V", t: "W", u: "X", I: "Y", v: "Z",
+  "+": "+", "/": "/", "=": "=",
 };
 
 function decodeArrayData(value) {
@@ -249,26 +174,18 @@ function decodeArrayData(value) {
 const summaryCache = new Map();
 
 /* =========================================================
- * HOME / BUSQUEDA
- *
- * Esta parte se mantiene como la versión que ya funcionaba.
+ * PARSEO DE TARJETAS (home, catálogo, búsqueda)
  * ========================================================= */
 
 function extractMangaAnchors(html) {
   if (!html) return [];
 
-  const re =
-    /<a[^>]+href=["'](\/manga\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
-
+  const re = /<a[^>]+href=["'](\/manga\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
   const result = [];
-
   let match;
 
   while ((match = re.exec(html)) !== null) {
-    result.push({
-      href: match[1],
-      inner: match[2],
-    });
+    result.push({ href: match[1], inner: match[2] });
   }
 
   return result;
@@ -277,74 +194,42 @@ function extractMangaAnchors(html) {
 function parseMangaCards(html) {
   if (!html) return [];
 
-  const anchors = extractMangaAnchors(html);
-
   const groups = new Map();
 
-  for (const anchor of anchors) {
+  for (const anchor of extractMangaAnchors(html)) {
     const rawId = slugFromMangaHref(anchor.href);
-
     if (!rawId) continue;
 
     let cover = null;
     let title = "";
 
-    const imageMatch = anchor.inner.match(
-      /<img[^>]+(?:data-src|src)=["']([^"']+)["']/i
-    );
+    const imageMatch = anchor.inner.match(/<img[^>]+(?:data-src|src)=["']([^"']+)["']/i);
+    if (imageMatch) cover = absoluteUrl(imageMatch[1]);
 
-    if (imageMatch) {
-      cover = absoluteUrl(imageMatch[1]);
-    }
-
-    const altMatch = anchor.inner.match(
-      /<img[^>]+alt=["']([^"']+)["']/i
-    );
-
+    const altMatch = anchor.inner.match(/<img[^>]+alt=["']([^"']+)["']/i);
     if (altMatch) {
-      title = cleanText(
-        altMatch[1]
-          .replace(/^Portada de\s*/i, "")
-          .trim()
-      );
+      title = cleanText(altMatch[1].replace(/^Portada de\s*/i, "").trim());
     }
 
     if (!title) {
       const headingMatch = anchor.inner.match(
         /<(?:h[1-6]|span|strong|b)[^>]*>([\s\S]*?)<\/(?:h[1-6]|span|strong|b)>/i
       );
-
-      if (headingMatch) {
-        title = cleanText(headingMatch[1]);
-      }
+      if (headingMatch) title = cleanText(headingMatch[1]);
     }
 
-    if (!title) {
-      title = cleanText(anchor.inner);
-    }
+    if (!title) title = cleanText(anchor.inner);
 
     if (!groups.has(rawId)) {
-      groups.set(rawId, {
-        rawId,
-        cover,
-        title,
-      });
+      groups.set(rawId, { rawId, cover, title });
     } else {
       const existing = groups.get(rawId);
-
-      if (!existing.cover && cover) {
-        existing.cover = cover;
-      }
-
-      if (!existing.title && title) {
-        existing.title = title;
-      }
+      if (!existing.cover && cover) existing.cover = cover;
+      if (!existing.title && title) existing.title = title;
     }
   }
 
-  return Array.from(groups.values()).filter(
-    (item) => item.cover && item.title
-  );
+  return Array.from(groups.values()).filter((item) => item.cover && item.title);
 }
 
 function dedupeCardsBySlug(cards) {
@@ -352,10 +237,7 @@ function dedupeCardsBySlug(cards) {
   const result = [];
 
   for (const card of cards) {
-    if (!card?.rawId) continue;
-
-    if (seen.has(card.rawId)) continue;
-
+    if (!card?.rawId || seen.has(card.rawId)) continue;
     seen.add(card.rawId);
     result.push(card);
   }
@@ -366,19 +248,13 @@ function dedupeCardsBySlug(cards) {
 function cardsToResults(cards) {
   return dedupeCardsBySlug(cards).map((card) => {
     const id = encodeMangaId(card.rawId);
-
     const result = {
       id,
       title: card.title,
       cover: absoluteUrl(card.cover),
     };
 
-    summaryCache.set(id, {
-      id,
-      title: result.title,
-      cover: result.cover,
-    });
-
+    summaryCache.set(id, { ...result });
     return result;
   });
 }
@@ -391,297 +267,139 @@ const plugin = {
   id: "usvusr",
   name: "LeerCapitulo",
 
-  /* =======================================================
-   * POPULAR
-   * ======================================================= */
+  /* ---------- POPULAR ---------- */
 
   async popular(offset, tagId) {
     if (tagId) {
-      return this._byGenre(offset, tagId);
+      return plugin._byGenre(offset, tagId);
     }
 
-    const page =
-      Math.floor(Number(offset || 0) / PAGE_SIZE) + 1;
-
-    const path =
-      page <= 1
-        ? "/"
-        : `/manga/?page=${page}`;
+    const page = Math.floor(Number(offset || 0) / PAGE_SIZE) + 1;
+    const path = page <= 1 ? "/manga/" : `/manga/?page=${page}`;
 
     const html = await fetchText(path);
-
     if (!html) return [];
 
-    const cards = parseMangaCards(html);
-
-    return cardsToResults(cards).slice(0, PAGE_SIZE);
+    return cardsToResults(parseMangaCards(html)).slice(0, PAGE_SIZE);
   },
 
-  /* =======================================================
-   * GENEROS
-   * ======================================================= */
+  /* ---------- GÉNEROS ---------- */
 
   async _byGenre(offset, tagId) {
-    const page =
-      Math.floor(Number(offset || 0) / PAGE_SIZE) + 1;
-
-    const encodedTag = encodeURIComponent(tagId);
-
-    const path =
-      `/manga/?genre=${encodedTag}&page=${page}`;
+    const page = Math.floor(Number(offset || 0) / PAGE_SIZE) + 1;
+    const path = `/manga/?genre=${encodeURIComponent(tagId)}&page=${page}`;
 
     const html = await fetchText(path);
-
     if (!html) return [];
 
-    const cards = parseMangaCards(html);
-
-    return cardsToResults(cards).slice(0, PAGE_SIZE);
+    return cardsToResults(parseMangaCards(html)).slice(0, PAGE_SIZE);
   },
 
-  /* =======================================================
-   * SEARCH
-   * ======================================================= */
+  /* ---------- SEARCH ---------- */
 
-  async search(query, offset, tagId) {
-    if (!query) return [];
-
-    const term = String(query).trim();
-
+  async search(query, offset) {
+    const term = String(query || "").trim();
     if (!term) return [];
 
-    const url =
-      `${BASE_URL}/search-autocomplete?term=${encodeURIComponent(term)}`;
-
+    const url = `${BASE_URL}/search-autocomplete?term=${encodeURIComponent(term)}`;
     const data = await fetchJson(url);
 
-    if (!Array.isArray(data)) {
-      return [];
-    }
+    if (!Array.isArray(data)) return [];
 
     const results = [];
 
     for (const item of data) {
       if (!item) continue;
 
-      const href =
-        item.link ||
-        item.url ||
-        item.href;
-
+      const href = item.link || item.url || item.href;
       const rawId = slugFromMangaHref(href);
-
       if (!rawId) continue;
 
       const id = encodeMangaId(rawId);
+      const title = cleanText(item.label || item.title || item.name || "") || rawId;
+      const cover = absoluteUrl(item.thumbnail || item.cover || item.image);
 
-      const title =
-        cleanText(
-          item.label ||
-          item.title ||
-          item.name ||
-          ""
-        ) || rawId;
-
-      const cover = absoluteUrl(
-        item.thumbnail ||
-        item.cover ||
-        item.image
-      );
-
-      const result = {
-        id,
-        title,
-        cover,
-      };
-
-      summaryCache.set(id, {
-        id,
-        title,
-        cover,
-      });
-
+      const result = { id, title, cover };
+      summaryCache.set(id, { ...result });
       results.push(result);
     }
 
     const start = Number(offset || 0);
-
-    return results.slice(
-      start,
-      start + PAGE_SIZE
-    );
+    return results.slice(start, start + PAGE_SIZE);
   },
 
-  /* =======================================================
-   * DETAIL
-   *
-   * IMPORTANTE:
-   * Aquí usamos mangaUrlFromId() y pasamos la misma URL
-   * junto con el HTML a chapters().
-   * ======================================================= */
+  /* ---------- DETAIL ----------
+   * Descarga la ficha una sola vez y se la pasa a chapters()
+   * para no volver a pedir la misma página. */
 
   async detail(id) {
     if (!id) return null;
 
     const cached = summaryCache.get(id);
-
     const mangaUrl = mangaUrlFromId(id);
 
-    if (!mangaUrl) {
-      return cached ? { ...cached } : null;
-    }
+    if (!mangaUrl) return cached ? { ...cached } : null;
 
-    harbor.log?.(
-      `LeerCapitulo detail URL: ${mangaUrl}`
-    );
+    harbor.log?.(`LeerCapitulo detail URL: ${mangaUrl}`);
 
     const html = await fetchText(mangaUrl);
 
     if (!html) {
-      harbor.log?.(
-        `LeerCapitulo: no se pudo cargar la ficha ${mangaUrl}`
-      );
-
-      if (cached) {
-        return { ...cached };
-      }
-
-      return null;
+      harbor.log?.(`LeerCapitulo: no se pudo cargar la ficha ${mangaUrl}`);
+      return cached ? { ...cached } : null;
     }
 
-    /* -----------------------------------------------------
-     * TITULO
-     * ----------------------------------------------------- */
+    /* Título */
+    const titleMatch = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+    const title = titleMatch ? cleanText(titleMatch[1]) : cached?.title || id;
 
-    const titleMatch = html.match(
-      /<h1[^>]*>([\s\S]*?)<\/h1>/i
-    );
-
-    const title =
-      titleMatch
-        ? cleanText(titleMatch[1])
-        : cached?.title || id;
-
-    /* -----------------------------------------------------
-     * TITULO ALTERNATIVO
-     * ----------------------------------------------------- */
-
-    const altMatch = html.match(
-      /<p class="small lc-muted mb-2">([\s\S]*?)<\/p>/i
-    );
-
+    /* Títulos alternativos */
     let altTitle;
-
+    const altMatch = html.match(/<p class="small lc-muted mb-2">([\s\S]*?)<\/p>/i);
     if (altMatch) {
       const parts = cleanText(altMatch[1])
         .split("·")
         .map((s) => s.trim())
         .filter(Boolean);
-
-      if (parts.length) {
-        altTitle = parts.join(", ");
-      }
+      if (parts.length) altTitle = parts.join(", ");
     }
 
-    /* -----------------------------------------------------
-     * PORTADA
-     * ----------------------------------------------------- */
+    /* Portada */
+    const coverMatch = html.match(/<div class="lc-cover-lg">[\s\S]*?<img[^>]+src=["']([^"']+)["']/i);
+    const cover = absoluteUrl(coverMatch?.[1]) || cached?.cover;
 
-    const coverMatch = html.match(
-      /<div class="lc-cover-lg">[\s\S]*?<img[^>]+src=["']([^"']+)["']/i
-    );
-
-    const cover =
-      absoluteUrl(
-        coverMatch?.[1]
-      ) ||
-      cached?.cover;
-
-    /* -----------------------------------------------------
-     * SINOPSIS
-     * ----------------------------------------------------- */
-
-    const synopsisMatch = html.match(
-      /id=["']sinopsis["'][\s\S]*?<p[^>]*>([\s\S]*?)<\/p>/i
-    );
-
+    /* Sinopsis */
     let description;
-
+    const synopsisMatch = html.match(/id=["']sinopsis["'][\s\S]*?<p[^>]*>([\s\S]*?)<\/p>/i);
     if (synopsisMatch) {
-      const text = cleanText(
-        synopsisMatch[1]
-      );
-
-      if (
-        text &&
-        !text
-          .toLowerCase()
-          .includes("no tiene sinopsis")
-      ) {
+      const text = cleanText(synopsisMatch[1]);
+      if (text && !text.toLowerCase().includes("no tiene sinopsis")) {
         description = text;
       }
     }
 
-    /* -----------------------------------------------------
-     * ESTADO
-     * ----------------------------------------------------- */
-
-    const statusBlockMatch = html.match(
-      /<span class="k">Estado<\/span>([\s\S]*?)<\/li>/i
-    );
-
+    /* Estado */
     let status;
-
+    const statusBlockMatch = html.match(/<span class="k">Estado<\/span>([\s\S]*?)<\/li>/i);
     if (statusBlockMatch) {
-      const statusRaw = cleanText(
-        statusBlockMatch[1]
-      ).toLowerCase();
-
-      if (
-        statusRaw.includes("curso") ||
-        statusRaw.includes("ongoing")
-      ) {
+      const statusRaw = cleanText(statusBlockMatch[1]).toLowerCase();
+      if (statusRaw.includes("curso") || statusRaw.includes("ongoing")) {
         status = "ongoing";
-      } else if (
-        statusRaw.includes("complet") ||
-        statusRaw.includes("finaliz")
-      ) {
+      } else if (statusRaw.includes("complet") || statusRaw.includes("finaliz")) {
         status = "completed";
       }
     }
 
-    /* -----------------------------------------------------
-     * AUTOR
-     * ----------------------------------------------------- */
+    /* Autor */
+    const authorMatch = html.match(/<span class="k">Autor<\/span>([\s\S]*?)<\/li>/i);
+    const author = authorMatch ? cleanText(authorMatch[1]) || undefined : undefined;
 
-    const authorMatch = html.match(
-      /<span class="k">Autor<\/span>([\s\S]*?)<\/li>/i
-    );
+    /* Capítulos (reutiliza el HTML ya descargado) */
+    const chapters = await plugin.chapters(mangaUrl, html);
 
-    const author =
-      authorMatch
-        ? cleanText(authorMatch[1]) || undefined
-        : undefined;
+    harbor.log?.(`LeerCapitulo: capítulos encontrados: ${chapters.length}`);
 
-    /* -----------------------------------------------------
-     * CAPITULOS
-     *
-     * Pasamos la URL real y el HTML ya descargado.
-     * ----------------------------------------------------- */
-
-    const chapters = await plugin.chapters(
-      mangaUrl,
-      html
-    );
-
-    harbor.log?.(
-      `LeerCapitulo: capítulos encontrados: ${chapters.length}`
-    );
-
-    const lastChapter =
-      chapters.length > 0
-        ? chapters[chapters.length - 1].chapter
-        : undefined;
+    const lastChapter = chapters.length ? chapters[chapters.length - 1].chapter : undefined;
 
     const result = {
       id,
@@ -694,318 +412,167 @@ const plugin = {
       author,
     };
 
-    summaryCache.set(id, {
-      id: result.id,
-      title: result.title,
-      cover: result.cover,
-    });
-
+    summaryCache.set(id, { id, title, cover });
     return result;
   },
 
-  /* =======================================================
-   * CHAPTERS
-   *
-   * Primero intenta DOM.
-   * Si Harbor no permite ese selector o falla el parseo,
-   * usa regex como fallback.
-   * ======================================================= */
+  /* ---------- CHAPTERS ----------
+   * Acepta opcionalmente el HTML ya descargado. */
 
-  async chapters(id) {
-  const mangaUrl = mangaUrlFromId(id);
+  async chapters(id, prefetchedHtml) {
+    const mangaUrl = mangaUrlFromId(id);
+    if (!mangaUrl) return [];
 
-  if (!mangaUrl) {
-    return [];
-  }
+    const html = prefetchedHtml || (await fetchText(mangaUrl));
+    if (!html) return [];
 
-  const html = await fetchText(mangaUrl);
+    const chapters = [];
+    const seen = new Set();
 
-  if (!html) {
-    return [];
-  }
+    /* Enlaces del tipo /leer/<id>/<slug>/<numero>/ */
+    const re = /<a\b[^>]*href=["']([^"']*\/leer\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
 
-  const chapters = [];
-  const seen = new Set();
+    let match;
+    while ((match = re.exec(html)) !== null) {
+      const href = match[1];
+      const inner = match[2];
 
-  /*
-   * LeerCapitulo actualmente genera enlaces como:
-   *
-   * /leer/aq095eld86/sobreviviendo-a-los-barbaros-de-un-juego/162/
-   */
+      const chapterUrl = absoluteUrl(href);
+      if (!chapterUrl || seen.has(chapterUrl)) continue;
+      seen.add(chapterUrl);
 
-  const re =
-    /<a\b[^>]*href=["']([^"']*\/leer\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+      /* Número: último segmento numérico de la URL */
+      const cleanHref = href.split("?")[0].split("#")[0];
+      const parts = cleanHref.split("/").filter(Boolean);
 
-  let match;
-
-  while ((match = re.exec(html)) !== null) {
-    const href = match[1];
-    const inner = match[2];
-
-    const chapterUrl = absoluteUrl(href);
-
-    if (!chapterUrl) {
-      continue;
-    }
-
-    if (seen.has(chapterUrl)) {
-      continue;
-    }
-
-    seen.add(chapterUrl);
-
-    /*
-     * Número = último segmento de la URL.
-     */
-    const cleanHref = href
-      .split("?")[0]
-      .split("#")[0];
-
-    const parts = cleanHref
-      .split("/")
-      .filter(Boolean);
-
-    let chapter = null;
-
-    if (parts.length) {
-      const last = parts[parts.length - 1];
-
-      if (/^\d+(?:\.\d+)?$/.test(last)) {
-        chapter = last;
+      let chapter = null;
+      if (parts.length) {
+        const last = parts[parts.length - 1];
+        if (/^\d+(?:\.\d+)?$/.test(last)) chapter = last;
       }
+
+      /* Fecha: se extrae y se quita antes de limpiar el título,
+       * para que no aparezca dentro del título del capítulo. */
+      let publishAt;
+      const dateMatch = inner.match(
+        /<span[^>]*class=["'][^"']*\bd\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/i
+      );
+      if (dateMatch) publishAt = cleanText(dateMatch[1]) || undefined;
+
+      const innerWithoutDate = inner.replace(
+        /<span[^>]*class=["'][^"']*\bd\b[^"']*["'][^>]*>[\s\S]*?<\/span>/gi,
+        " "
+      );
+
+      let title = cleanText(innerWithoutDate);
+
+      const numberMatch = title.match(/Cap[ií]tulo\s+([0-9]+(?:\.[0-9]+)?)/i);
+      if (numberMatch) chapter = numberMatch[1];
+
+      if (!title) {
+        title = chapter ? `Capítulo ${chapter}` : "Sin título";
+      }
+
+      chapters.push({
+        id: chapterUrl,
+        chapter,
+        title,
+        pages: 1,
+        language: "es",
+        publishAt,
+      });
     }
 
-    /*
-     * Título.
-     */
-    let title = cleanText(inner);
+    chapters.sort((a, b) => {
+      const na = parseFloat(a.chapter);
+      const nb = parseFloat(b.chapter);
 
-    const numberMatch = title.match(
-      /Cap[ií]tulo\s+([0-9]+(?:\.[0-9]+)?)/i
-    );
+      if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
 
-    if (numberMatch) {
-      chapter = numberMatch[1];
-    }
-
-    if (!title) {
-      title = chapter
-        ? `Capítulo ${chapter}`
-        : "Sin título";
-    }
-
-    /*
-     * Fecha.
-     */
-    const dateMatch = inner.match(
-      /<span[^>]*class=["'][^"']*\bd\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/i
-    );
-
-    const publishAt = dateMatch
-      ? cleanText(dateMatch[1])
-      : undefined;
-
-    chapters.push({
-      id: chapterUrl,
-      chapter,
-      title,
-      pages: 1,
-      language: "es",
-      publishAt,
-    });
-  }
-
-  /*
-   * Orden ascendente.
-   */
-  chapters.sort((a, b) => {
-    const na = parseFloat(a.chapter);
-    const nb = parseFloat(b.chapter);
-
-    if (Number.isFinite(na) && Number.isFinite(nb)) {
-      return na - nb;
-    }
-
-    return String(a.title).localeCompare(
-      String(b.title),
-      "es",
-      {
+      return String(a.title).localeCompare(String(b.title), "es", {
         numeric: true,
         sensitivity: "base",
-      }
-    );
-  });
+      });
+    });
 
-  return chapters;
-}
+    return chapters;
+  },
 
-  /* =======================================================
-   * PAGE URLS
-   * ======================================================= */
+  /* ---------- PAGE URLS ----------
+   * Las imágenes del lector son lazy (data-src). */
 
   async pageUrls(chapterId) {
     if (!chapterId) return [];
 
     const html = await fetchText(chapterId);
+    if (!html) return [];
 
-    if (!html) {
-      return [];
-    }
-
-    /* -----------------------------------------------------
-     * PRIMER INTENTO:
-     * IMÁGENES DIRECTAS
-     * ----------------------------------------------------- */
-
+    /* PRIMER INTENTO: imágenes directas */
     const imageUrls = [];
-
-    const imageRe =
-      /<img[^>]+(?:src|data-src|data-lazy-src)=["']([^"']+)["']/gi;
-
-    const ignoredImage =
-      /logo|icon|avatar|favicon|sprite|banner|ads?|google|facebook|twitter|discord/i;
+    const imageRe = /<img[^>]+(?:src|data-src|data-lazy-src)=["']([^"']+)["']/gi;
 
     let match;
-
     while ((match = imageRe.exec(html)) !== null) {
       const url = absoluteUrl(match[1]);
-
-      if (!url) continue;
-
-      if (ignoredImage.test(url)) {
-        continue;
-      }
-
-      if (!imageUrls.includes(url)) {
-        imageUrls.push(url);
-      }
+      if (!url || isIgnoredImage(url) || imageUrls.includes(url)) continue;
+      imageUrls.push(url);
     }
 
-    if (imageUrls.length > 0) {
-      return imageUrls;
-    }
+    if (imageUrls.length > 0) return imageUrls;
 
-    /* -----------------------------------------------------
-     * SEGUNDO INTENTO:
-     * array_data
-     * ----------------------------------------------------- */
-
-    const arrayMatch =
-      html.match(
-        /(?:array_data|array-data)\s*["'=:\s]+["']([^"']+)["']/i
-      );
-
+    /* SEGUNDO INTENTO: array_data cifrado */
+    const arrayMatch = html.match(/(?:array_data|array-data)\s*["'=:\s]+["']([^"']+)["']/i);
     if (arrayMatch) {
-      const decoded =
-        decodeArrayData(arrayMatch[1]);
-
-      if (decoded.length > 0) {
-        return decoded;
-      }
+      const decoded = decodeArrayData(arrayMatch[1]);
+      if (decoded.length > 0) return decoded;
     }
 
-    /* -----------------------------------------------------
-     * TERCER INTENTO:
-     * ad:check / contenido JS
-     * ----------------------------------------------------- */
-
-    const adCheckMatch =
-      html.match(
-        /ad:check[\s\S]{0,5000}?["']([^"']+)["']/i
-      );
-
+    /* TERCER INTENTO: ad:check */
+    const adCheckMatch = html.match(/ad:check[\s\S]{0,5000}?["']([^"']+)["']/i);
     if (adCheckMatch) {
-      const decoded =
-        decodeArrayData(adCheckMatch[1]);
-
-      if (decoded.length > 0) {
-        return decoded;
-      }
+      const decoded = decodeArrayData(adCheckMatch[1]);
+      if (decoded.length > 0) return decoded;
     }
 
     return [];
   },
 
-  /* =======================================================
-   * TAGS
-   * ======================================================= */
+  /* ---------- TAGS ----------
+   * Solo ids que existen como ?genre= en el sitio. */
 
   async tags() {
     return [
-      {
-        id: "accion",
-        title: "Acción",
-      },
-      {
-        id: "aventura",
-        title: "Aventura",
-      },
-      {
-        id: "comedia",
-        title: "Comedia",
-      },
-      {
-        id: "drama",
-        title: "Drama",
-      },
-      {
-        id: "fantasia",
-        title: "Fantasía",
-      },
-      {
-        id: "romance",
-        title: "Romance",
-      },
-      {
-        id: "isekai",
-        title: "Isekai",
-      },
-      {
-        id: "reencarnacion",
-        title: "Reencarnación",
-      },
-      {
-        id: "artes-marciales",
-        title: "Artes Marciales",
-      },
-      {
-        id: "cultivo",
-        title: "Cultivo",
-      },
-      {
-        id: "historico",
-        title: "Histórico",
-      },
-      {
-        id: "militar",
-        title: "Militar",
-      },
-      {
-        id: "misterio",
-        title: "Misterio",
-      },
-      {
-        id: "psicologico",
-        title: "Psicológico",
-      },
-      {
-        id: "sobrenatural",
-        title: "Sobrenatural",
-      },
-      {
-        id: "thriller",
-        title: "Thriller",
-      },
-      {
-        id: "web-novel",
-        title: "Web Novel",
-      },
-      {
-        id: "novela-ligera",
-        title: "Novela Ligera",
-      },
+      { id: "accion", title: "Acción" },
+      { id: "aventura", title: "Aventura" },
+      { id: "comedia", title: "Comedia" },
+      { id: "drama", title: "Drama" },
+      { id: "fantasia", title: "Fantasía" },
+      { id: "romance", title: "Romance" },
+      { id: "isekai", title: "Isekai" },
+      { id: "reencarnacion", title: "Reencarnación" },
+      { id: "artes-marciales", title: "Artes Marciales" },
+      { id: "historical", title: "Histórico" },
+      { id: "militar", title: "Militar" },
+      { id: "misterio", title: "Misterio" },
+      { id: "psicologico", title: "Psicológico" },
+      { id: "sobrenatural", title: "Sobrenatural" },
+      { id: "thriller", title: "Thriller" },
     ];
   },
 };
+
+/* Filtra logos, iconos y anuncios mirando solo el pathname,
+ * con límites de palabra para no descartar páginas reales
+ * (antes "ads?" coincidía con cualquier "ad" dentro de un hash). */
+const IGNORED_IMAGE_RE =
+  /(?:^|[\/._-])(logo|icon|avatar|favicon|sprite|banner|ads?|google|facebook|twitter|discord)(?:[\/._-]|$)/i;
+
+function isIgnoredImage(url) {
+  try {
+    return IGNORED_IMAGE_RE.test(new URL(url).pathname);
+  } catch {
+    return false;
+  }
+}
 
 export default plugin;
