@@ -12,12 +12,11 @@
       "entry": "mangalect.plugin.js"
     },
     {
-      "id": "leercapitulo",
-      "name": "LeerCapítulo",
-      "version": "1.0.5",
+      "id": "usvusr",
+      "name": "LeerCapitulo",
+      "version": "2.0.0",
       "lang": "es",
       "nsfw": false,
-      "icon": "https://www.leercapitulo.co/favicon.ico",
       "entry": "leercapitulo.plugin.js"
     },
     {
