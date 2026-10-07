@@ -184,6 +184,16 @@ function extractMangaAnchors(html) {
   return result;
 }
 
+/* Etiquetas de tipo que a veces aparecen como alt o texto de la portada. */
+const TYPE_LABEL_RE = /^(manga|manhwa|manhua|novela|novel|comic|webtoon|one[- ]?shot|doujinshi)$/i;
+
+function usableTitle(text) {
+  const t = String(text || "").trim();
+  return t && !TYPE_LABEL_RE.test(t) ? t : "";
+}
+
+/* Prioridad del título: 3 = clase de título explícita, 2 = alt "Portada de X",
+ * 1 = texto del enlace. Solo se sustituye un título por otro de mayor prioridad. */
 function parseMangaCards(html) {
   if (!html) return [];
 
@@ -194,29 +204,45 @@ function parseMangaCards(html) {
     if (!rawId) continue;
 
     let cover = null;
-    let title = "";
-
     const imageMatch = anchor.inner.match(/<img[^>]+(?:data-src|src)=["']([^"']+)["']/i);
     if (imageMatch) cover = absoluteUrl(imageMatch[1]);
 
-    const altMatch = anchor.inner.match(/<img[^>]+alt=["']([^"']+)["']/i);
-    if (altMatch) title = cleanText(altMatch[1].replace(/^Portada de\s*/i, "").trim());
+    let title = "";
+    let rank = 0;
 
-    if (!title) {
-      const headingMatch = anchor.inner.match(
-        /<(?:h[1-6]|span|strong|b)[^>]*>([\s\S]*?)<\/(?:h[1-6]|span|strong|b)>/i
-      );
-      if (headingMatch) title = cleanText(headingMatch[1]);
+    const explicit = anchor.inner.match(
+      /<(?:h[1-6]|span|strong|b|div|p)[^>]*class=["'][^"']*(?:lc-release-title|lc-side-name|lc-slide-name)[^"']*["'][^>]*>([\s\S]*?)<\/(?:h[1-6]|span|strong|b|div|p)>/i
+    );
+    if (explicit && usableTitle(cleanText(explicit[1]))) {
+      title = usableTitle(cleanText(explicit[1]));
+      rank = 3;
     }
 
-    if (!title) title = cleanText(anchor.inner);
+    if (rank < 2) {
+      const alt = anchor.inner.match(/<img[^>]+alt=["']Portada de\s+([^"']+)["']/i);
+      if (alt && usableTitle(cleanText(alt[1]))) {
+        title = usableTitle(cleanText(alt[1]));
+        rank = 2;
+      }
+    }
+
+    if (rank < 1) {
+      const text = usableTitle(cleanText(anchor.inner));
+      if (text) {
+        title = text;
+        rank = 1;
+      }
+    }
 
     if (!groups.has(rawId)) {
-      groups.set(rawId, { rawId, cover, title });
+      groups.set(rawId, { rawId, cover, title, rank });
     } else {
       const existing = groups.get(rawId);
       if (!existing.cover && cover) existing.cover = cover;
-      if (!existing.title && title) existing.title = title;
+      if (rank > existing.rank) {
+        existing.title = title;
+        existing.rank = rank;
+      }
     }
   }
 
