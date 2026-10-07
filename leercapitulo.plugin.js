@@ -258,7 +258,7 @@ function isIgnoredImage(url) {
  * ========================================================= */
 
 const plugin = {
-  id: "usvusr",
+  id: "leercapitulo",
   name: "LeerCapitulo",
   lang: "es",
 
