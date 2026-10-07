@@ -279,6 +279,27 @@ function isIgnoredImage(url) {
   }
 }
 
+/* Elige el primer campo que tenga un título real (no una etiqueta de tipo). */
+function pickSearchTitle(item) {
+  const candidates = [item.title, item.name, item.label, item.value, item.text, item.nombre];
+  for (const c of candidates) {
+    if (typeof c !== "string") continue;
+    const t = usableTitle(cleanText(c));
+    if (t) return t;
+  }
+  return "";
+}
+
+/* Último recurso: "u-dont-know-me" -> "U Dont Know Me". */
+function titleFromSlug(rawId) {
+  const last = String(rawId).split("/").filter(Boolean).pop() || rawId;
+  return last
+    .split("-")
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
 /* =========================================================
  * PROVIDER
  * ========================================================= */
@@ -320,24 +341,39 @@ const plugin = {
     const term = String(query || "").trim();
     if (!term) return [];
 
-    const data = await fetchJson(
+    const raw = await fetchJson(
       `${BASE_URL}/search-autocomplete?term=${encodeURIComponent(term)}`
     );
-    if (!Array.isArray(data)) return [];
+
+    // La respuesta puede ser un array o un objeto con el array dentro.
+    const data = Array.isArray(raw)
+      ? raw
+      : Array.isArray(raw?.results)
+      ? raw.results
+      : Array.isArray(raw?.data)
+      ? raw.data
+      : [];
+
+    if (data.length && data[0] && typeof data[0] === "object") {
+      harbor.log?.(`LeerCapitulo search campos: ${Object.keys(data[0]).join(", ")}`);
+    } else {
+      harbor.log?.(`LeerCapitulo search: sin resultados para "${term}"`);
+    }
 
     const results = [];
     const seen = new Set();
 
     for (const item of data) {
-      if (!item) continue;
+      if (!item || typeof item !== "object") continue;
 
-      const rawId = slugFromMangaHref(item.link || item.url || item.href);
+      const href = item.link || item.url || item.href || item.path;
+      const rawId = slugFromMangaHref(href);
       if (!rawId || seen.has(rawId)) continue;
       seen.add(rawId);
 
       const id = encodeMangaId(rawId);
-      const title = cleanText(item.label || item.title || item.name || "") || rawId;
-      const cover = absoluteUrl(item.thumbnail || item.cover || item.image);
+      const title = pickSearchTitle(item) || titleFromSlug(rawId);
+      const cover = absoluteUrl(item.thumbnail || item.cover || item.image || item.img);
 
       const result = { id, title, cover };
       summaryCache.set(id, result);
@@ -462,6 +498,15 @@ const plugin = {
         language: "es",
         publishAt,
       });
+    }
+
+    // Diagnóstico: la ficha indica cuántos capítulos hay ("2 disponibles").
+    const declared = html.match(/(\d+)\s+disponibles/);
+    harbor.log(`LeerCapitulo chapters ${mangaUrl}: ${chapters.length} encontrados`);
+    if (declared && Number(declared[1]) !== chapters.length) {
+      harbor.log(
+        `LeerCapitulo chapters: el sitio dice ${declared[1]} y se leyeron ${chapters.length}`
+      );
     }
 
     chapters.sort((a, b) => {
