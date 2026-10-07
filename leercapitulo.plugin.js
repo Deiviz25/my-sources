@@ -300,6 +300,38 @@ function titleFromSlug(rawId) {
     .join(" ");
 }
 
+/* Devuelve el tramo [offset, offset+count) de un listado paginado del sitio.
+ * fetchPage(p) devuelve las tarjetas de la página p del sitio (1-indexada).
+ * El tamaño de página del sitio se mide con la página 1. */
+async function fetchCardsRange(fetchPage, offset, count) {
+  const firstPage = await fetchPage(1);
+  if (!firstPage.length) return [];
+
+  const size = firstPage.length;
+  const startPage = Math.floor(offset / size) + 1;
+  const endPage = Math.floor((offset + count - 1) / size) + 1;
+
+  const pages = new Map([[1, firstPage]]);
+  const missing = [];
+  for (let p = Math.max(startPage, 2); p <= endPage; p++) missing.push(p);
+
+  const fetched = await Promise.all(missing.map((p) => fetchPage(p).then((c) => [p, c])));
+  for (const [p, cards] of fetched) pages.set(p, cards);
+
+  const all = [];
+  for (let p = startPage; p <= endPage; p++) all.push(...(pages.get(p) || []));
+
+  const local = offset - (startPage - 1) * size;
+  const seen = new Set();
+  return all
+    .slice(local, local + count)
+    .filter((c) => {
+      if (seen.has(c.id)) return false;
+      seen.add(c.id);
+      return true;
+    });
+}
+
 /* =========================================================
  * PROVIDER
  * ========================================================= */
@@ -309,75 +341,75 @@ const plugin = {
   name: "LeerCapitulo",
   lang: "es",
 
-  /* ---------- POPULAR ---------- */
+  /* ---------- POPULAR ----------
+   * El sitio no sabemos cuántas mangas muestra por página, así que se mide
+   * con la página 1 y se piden las páginas necesarias para cubrir el tramo. */
 
   async popular(offset, tagId) {
-    if (tagId) return plugin._byGenre(offset, tagId);
+    const basePath = tagId ? `/manga/?genre=${encodeURIComponent(tagId)}` : "/manga/";
+    const sep = basePath.includes("?") ? "&" : "?";
 
-    const page = Math.floor(Number(offset || 0) / PAGE_SIZE) + 1;
-    const path = page <= 1 ? "/manga/" : `/manga/?page=${page}`;
+    const fetchPage = async (p) => {
+      const html = await fetchText(p > 1 ? `${basePath}${sep}page=${p}` : basePath);
+      return html ? cardsToResults(parseMangaCards(html)) : [];
+    };
 
-    const html = await fetchText(path);
-    if (!html) return [];
-
-    return cardsToResults(parseMangaCards(html)).slice(0, PAGE_SIZE);
-  },
-
-  /* ---------- GÉNEROS ---------- */
-
-  async _byGenre(offset, tagId) {
-    const page = Math.floor(Number(offset || 0) / PAGE_SIZE) + 1;
-    const html = await fetchText(`/manga/?genre=${encodeURIComponent(tagId)}&page=${page}`);
-    if (!html) return [];
-
-    return cardsToResults(parseMangaCards(html)).slice(0, PAGE_SIZE);
+    return fetchCardsRange(fetchPage, Number(offset || 0), PAGE_SIZE);
   },
 
   /* ---------- SEARCH ----------
-   * El autocompletado del sitio no admite filtro por género, así que
-   * tagId se ignora aquí. */
+   * Acepta la respuesta como JSON o como fragmento HTML, y deja en el
+   * registro el inicio de la respuesta para poder ajustarla. */
 
-  async search(query, offset /*, tagId */) {
+  async search(query, offset, tagId) {
     const term = String(query || "").trim();
-    if (!term) return [];
-
-    const raw = await fetchJson(
-      `${BASE_URL}/search-autocomplete?term=${encodeURIComponent(term)}`
-    );
-
-    // La respuesta puede ser un array o un objeto con el array dentro.
-    const data = Array.isArray(raw)
-      ? raw
-      : Array.isArray(raw?.results)
-      ? raw.results
-      : Array.isArray(raw?.data)
-      ? raw.data
-      : [];
-
-    if (data.length && data[0] && typeof data[0] === "object") {
-      harbor.log?.(`LeerCapitulo search campos: ${Object.keys(data[0]).join(", ")}`);
-    } else {
-      harbor.log?.(`LeerCapitulo search: sin resultados para "${term}"`);
+    if (!term) {
+      return tagId ? plugin.popular(offset, tagId) : [];
     }
 
-    const results = [];
-    const seen = new Set();
+    const body = await fetchText(`/search-autocomplete?term=${encodeURIComponent(term)}`);
+    if (!body) {
+      harbor.log(`LeerCapitulo search: sin respuesta para "${term}"`);
+      return [];
+    }
+    harbor.log(`LeerCapitulo search body: ${body.slice(0, 200)}`);
 
-    for (const item of data) {
-      if (!item || typeof item !== "object") continue;
+    const trimmed = body.trim();
+    let results = [];
 
-      const href = item.link || item.url || item.href || item.path;
-      const rawId = slugFromMangaHref(href);
-      if (!rawId || seen.has(rawId)) continue;
-      seen.add(rawId);
+    if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+      let data = [];
+      try {
+        const parsed = JSON.parse(trimmed);
+        data = Array.isArray(parsed) ? parsed : parsed.results || parsed.data || [];
+      } catch (e) {
+        harbor.log(`LeerCapitulo search: JSON no válido: ${String(e)}`);
+      }
 
-      const id = encodeMangaId(rawId);
-      const title = pickSearchTitle(item) || titleFromSlug(rawId);
-      const cover = absoluteUrl(item.thumbnail || item.cover || item.image || item.img);
-
-      const result = { id, title, cover };
-      summaryCache.set(id, result);
-      results.push(result);
+      for (const item of data) {
+        if (!item || typeof item !== "object") continue;
+        const rawId = slugFromMangaHref(item.link || item.url || item.href || item.path);
+        if (!rawId) continue;
+        const id = encodeMangaId(rawId);
+        const result = {
+          id,
+          title: pickSearchTitle(item) || titleFromSlug(rawId),
+          cover: absoluteUrl(item.thumbnail || item.cover || item.image || item.img),
+        };
+        summaryCache.set(id, result);
+        results.push(result);
+      }
+    } else {
+      // Fragmento HTML: cada resultado es un enlace a /manga/...
+      results = cardsToResults(
+        extractMangaAnchors(body)
+          .map((a) => {
+            const rawId = slugFromMangaHref(a.href);
+            const title = usableTitle(cleanText(a.inner));
+            return rawId && title ? { rawId, title, cover: null } : null;
+          })
+          .filter(Boolean)
+      );
     }
 
     const start = Number(offset || 0);
