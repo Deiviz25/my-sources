@@ -30,7 +30,7 @@
 //   3. pageUrls() — la más importante y la más insegura: NO tengo HTML de
 //      ninguna página de lectura de capítulo (algo como
 //      https://es.novelcool.com/chapter/.../....html), así que no sé cómo
-//      estructura las imágenes ahí. Below hay una heurística que prueba
+//      estructura las imágenes ahí. Más abajo hay una heurística que prueba
 //      varios selectores típicos, pero es una apuesta, no algo verificado.
 //      Si la lectura no funciona, mándame el HTML de un capítulo real (el
 //      mismo tipo de "ver código fuente" que ya me pasaste para las otras
